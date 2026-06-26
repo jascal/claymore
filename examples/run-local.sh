@@ -6,12 +6,18 @@
 # Edit the paths/model below (or override via env), then: ./examples/run-local.sh
 set -e
 LLAMA=${LLAMA:-$HOME/code/llama.cpp/build/bin/llama-server}
-MODEL=${MODEL:-$HOME/code/llama.cpp/models/qwen2.5-coder-7b-instruct-q4_k_m.gguf}
+# Model: by default auto-download from Hugging Face (-hf, cached under ~/.cache/llama.cpp on first run, ~4.7 GB).
+# Qwen2.5-Coder-7B-Instruct Q4_K_M runs well on an 8 GB GPU fully offloaded (-ngl 99) and is reliable at tool-calling.
+# To use a local .gguf instead, set MODEL=/path/to/model.gguf ; or pick a different repo with HF_REPO=... .
+# Smaller/comfier option for tighter VRAM:  HF_REPO=Qwen/Qwen2.5-Coder-3B-Instruct-GGUF:Q4_K_M
+HF_REPO=${HF_REPO:-Qwen/Qwen2.5-Coder-7B-Instruct-GGUF:Q4_K_M}
+MODEL=${MODEL:-}
 SG=${SG:-$HOME/code/sgiandubh}
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
 
-echo "1/3 · coding model on the GPU (tool-calling via --jinja, default on) → :8080"
-"$LLAMA" -m "$MODEL" -ngl 99 -c 8192 --host 127.0.0.1 --port 8080 >/tmp/llama.log 2>&1 &
+if [ -n "$MODEL" ]; then SRC=(-m "$MODEL"); else SRC=(-hf "$HF_REPO"); fi
+echo "1/3 · coding model on the GPU (CUDA -ngl 99 · tool-calling --jinja) → :8080   [${MODEL:-$HF_REPO}]"
+"$LLAMA" "${SRC[@]}" -ngl 99 -c 8192 --jinja --host 127.0.0.1 --port 8080 >/tmp/llama.log 2>&1 &
 echo "2/3 · bounded-expert spokes → :8081 (riscv), :8082 (logic)"
 "$SG/build/sgiandubh" "$SG/package_riscv" 8081 --answer-from-corpus >/tmp/spoke_riscv.log 2>&1 &
 "$SG/build/sgiandubh" "$SG/package_logic" 8082 --answer-from-corpus >/tmp/spoke_logic.log 2>&1 &
