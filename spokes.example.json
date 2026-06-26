@@ -1,0 +1,14 @@
+{
+  "spokes": [
+    {"name": "riscv",   "url": "http://localhost:8081", "domain": "RISC-V ISA specification"},
+    {"name": "logic",   "url": "http://localhost:8082", "domain": "formal logic"},
+    {"name": "anatomy", "url": "http://localhost:8083", "domain": "human anatomy & physiology"}
+  ],
+  "mode": "deterministic",
+  "top_k": 3,
+  "synthesis": {
+    "url": "https://api.openai.com/v1",
+    "model": "gpt-4o-mini",
+    "api_key_env": "OPENAI_API_KEY"
+  }
+}
