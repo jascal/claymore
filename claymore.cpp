@@ -34,6 +34,7 @@ struct Result {                                   // the hub's answer + provenan
 static std::vector<Spoke> g_spokes;
 static std::string g_mode = "deterministic";
 static int g_top_k = 3;
+static std::string g_tool_style = "generic";      // tools mode: "generic" (one consult_experts tool) | "per-expert"
 static json g_synth = json::object();             // {url, model, api_key_env, format:"openai"|"anthropic", max_tokens}
 static const char* REFUSE = "I don't have anything on that in the available material.";
 
@@ -161,6 +162,118 @@ static Result synthesize(const std::string& query, const std::vector<SAns>& rank
 static Result hub_answer(const std::string& query) {
     auto ranked = fan_out(query);
     return g_mode == "llm" ? synthesize(query, ranked) : deterministic(ranked);
+}
+
+// ---- mode:"tools" — agentic routing: the synthesis LLM calls spokes as TOOLS; claymore executes them ------------
+// claymore speaks the OpenAI tool-calling protocol on behalf of the hub LLM: it offers each spoke as a function,
+// runs the LLM, executes any spoke tool_calls (the real spoke query), feeds the cited result back, and loops to a
+// final answer. (sgiandubh, the leaf, has no tools — it answers.)
+static json query_param() {
+    return json{{"type", "object"},
+                {"properties", json{{"query", json{{"type", "string"}, {"description", "the question to ask"}}}}},
+                {"required", json::array({"query"})}};
+}
+static json spoke_tools() {
+    json tools = json::array();
+    if (g_tool_style == "per-expert") {                              // one tool per spoke — the LLM picks the expert
+        for (const auto& sp : g_spokes) {
+            json fn;
+            fn["name"] = "ask_" + sp.name;
+            fn["description"] = "Consult the bounded expert on: " + sp.domain +
+                                ". Returns a cited answer, or indicates it has nothing (abstains).";
+            fn["parameters"] = query_param();
+            tools.push_back(json{{"type", "function"}, {"function", fn}});
+        }
+    } else {                                                         // generic — one tool; claymore fan-out-routes
+        std::string domains;
+        for (size_t i = 0; i < g_spokes.size(); i++)
+            domains += (i ? ", " : "") + g_spokes[i].name + " (" + g_spokes[i].domain + ")";
+        json fn;
+        fn["name"] = "consult_experts";
+        fn["description"] = "Ask the bounded-expert hub. It routes to whichever expert covers the question and "
+                            "returns a cited answer, or says nothing is covered. Experts: " + domains + ".";
+        fn["parameters"] = query_param();
+        tools.push_back(json{{"type", "function"}, {"function", fn}});
+    }
+    return tools;
+}
+
+// One tool-capable LLM turn (OpenAI shape). Returns the assistant message, or null on failure.
+static json llm_turn(const json& messages, const json& tools) {
+    std::string origin, base;
+    split_url(g_synth.value("url", ""), origin, base);
+    httplib::Client cli(origin);
+    cli.set_connection_timeout(10);
+    cli.set_read_timeout(120);
+    const char* key = std::getenv(g_synth.value("api_key_env", "OPENAI_API_KEY").c_str());
+    httplib::Headers h = {{"Authorization", std::string("Bearer ") + (key ? key : "")}};
+    json req;
+    req["model"] = g_synth.value("model", "gpt-4o-mini");
+    req["messages"] = messages;
+    if (!tools.empty()) { req["tools"] = tools; req["tool_choice"] = "auto"; }
+    auto res = cli.Post(base + "/chat/completions", h, req.dump(), "application/json");
+    if (!res || res->status != 200) return json(nullptr);
+    try { return json::parse(res->body)["choices"][0]["message"]; } catch (...) { return json(nullptr); }
+}
+
+static Result run_tools_loop(const json& client_messages) {
+    Result r;
+    r.mode = "tools";
+    json msgs = client_messages.is_array() ? client_messages : json::array();
+    json tools = spoke_tools();
+    const int MAX_ITERS = 6;
+    for (int it = 0; it < MAX_ITERS; it++) {
+        json m = llm_turn(msgs, tools);
+        if (m.is_null()) { r.body = REFUSE; r.mode = "abstain"; return r; }   // backend unreachable
+        if (m.contains("tool_calls") && m["tool_calls"].is_array() && !m["tool_calls"].empty()) {
+            msgs.push_back(m);                                                // the assistant turn (with tool_calls)
+            for (const auto& tc : m["tool_calls"]) {
+                std::string name = tc.value("function", json::object()).value("name", "");
+                std::string argstr = tc.value("function", json::object()).value("arguments", "{}");
+                std::string q;
+                try { q = json::parse(argstr).value("query", ""); } catch (...) {}
+                std::string toolres;
+                if (name == "consult_experts") {                              // generic: claymore fan-out-routes
+                    auto ranked = fan_out(q);
+                    if (ranked.empty()) toolres = "(no expert covers that — all abstained)";
+                    for (int k = 0; k < (int)ranked.size() && k < g_top_k; k++) {
+                        const SAns& a = ranked[k];
+                        std::string cite = !a.citation.empty() ? a.citation : a.source;
+                        toolres += "[" + a.spoke + "] " + a.answer + (cite.empty() ? "" : ("  (source: " + cite + ")")) + "\n";
+                        r.sources.push_back({a.spoke, cite});
+                    }
+                } else {                                                       // per-expert: ask_<spoke>
+                    std::string sn = (name.rfind("ask_", 0) == 0) ? name.substr(4) : name;
+                    const Spoke* sp = nullptr;
+                    for (const auto& s : g_spokes) if (s.name == sn) sp = &s;
+                    if (sp) {
+                        SAns a = ask_spoke(*sp, q);
+                        if (a.ok) {
+                            std::string cite = !a.citation.empty() ? a.citation : a.source;
+                            toolres = a.answer + (cite.empty() ? "" : ("  (source: " + cite + ")"));
+                            r.sources.push_back({sp->name, cite});
+                        } else {
+                            toolres = "(the " + sn + " expert has nothing on that — abstained)";
+                        }
+                    } else {
+                        toolres = "(unknown tool: " + name + ")";
+                    }
+                }
+                json tm;
+                tm["role"] = "tool";
+                tm["tool_call_id"] = tc.value("id", "");
+                tm["content"] = toolres;
+                msgs.push_back(tm);
+            }
+            continue;                                                        // loop: let the LLM use the results
+        }
+        r.body = m.value("content", "");                                     // final answer
+        if (r.body.empty()) r.body = REFUSE;
+        return r;
+    }
+    r.body = REFUSE;
+    r.mode = "abstain";
+    return r;                                                                // hit the iteration cap
 }
 
 // ---- rendering: text (default) or structured json (response_format) --------------------------------------------
@@ -296,7 +409,9 @@ static void handle(const httplib::Request& req, httplib::Response& res, const st
     json body;
     try { body = json::parse(req.body); }
     catch (...) { res.status = 400; res.set_content("{\"error\":\"invalid json\"}", "application/json"); return; }
-    Result r = hub_answer(user_text(body));
+    Result r = (g_mode == "tools" && !g_synth.value("url", "").empty())
+                   ? run_tools_loop(body.value("messages", json::array()))     // agentic: LLM calls spokes as tools
+                   : hub_answer(user_text(body));                              // deterministic | llm fan-out synthesis
     std::string content = wants_json(body) ? render_json(r) : render_text(r);
     if (body.value("stream", false)) { stream_answer(res, route, content); return; }
     if (route == "anthropic") res.set_content(anthropic_message(content).dump(), "application/json");
@@ -313,15 +428,26 @@ int main(int argc, char** argv) {
     for (auto& s : cfg["spokes"]) g_spokes.push_back({s.value("name", ""), s.value("url", ""), s.value("domain", "")});
     g_mode = cfg.value("mode", "deterministic");
     g_top_k = cfg.value("top_k", 3);
+    g_tool_style = cfg.value("tool_style", "generic");
     g_synth = cfg.value("synthesis", json::object());
+    std::string extra;
+    if (g_mode == "llm" || g_mode == "tools")
+        extra = " · synth=" + g_synth.value("format", "openai") + "@" + g_synth.value("url", "?");
+    if (g_mode == "tools") extra += " · tools=" + g_tool_style;
     fprintf(stderr, "claymore: %zu spokes · mode=%s%s · listening :%d\n", g_spokes.size(), g_mode.c_str(),
-            g_mode == "llm" ? (" · synth=" + g_synth.value("format", "openai") + "@" + g_synth.value("url", "?")).c_str() : "",
-            port);
+            extra.c_str(), port);
 
     httplib::Server svr;
     svr.Get("/v1/models", [](const httplib::Request&, httplib::Response& res) {
         json e; e["id"] = "claymore"; e["object"] = "model"; e["owned_by"] = "claymore";
         json m; m["object"] = "list"; m["data"] = json::array({e});
+        res.set_content(m.dump(), "application/json");
+    });
+    // domain manifest — so an outer agent (or claymore-as-a-tool) can discover what this hub covers.
+    svr.Get("/v1/domains", [](const httplib::Request&, httplib::Response& res) {
+        json data = json::array();
+        for (const auto& sp : g_spokes) data.push_back(json{{"name", sp.name}, {"domain", sp.domain}});
+        json m; m["object"] = "list"; m["data"] = data;
         res.set_content(m.dump(), "application/json");
     });
     svr.Post("/v1/chat/completions", [](const httplib::Request& q, httplib::Response& r) { handle(q, r, "chat"); });

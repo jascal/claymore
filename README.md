@@ -10,6 +10,9 @@ confidence, and answers in one of two modes:
   injection-immune); no LLM in the loop.
 - **llm** — synthesizes across the surviving cited answers with a hub LLM (any OpenAI-compatible endpoint). Flexible
   and conversational, but reintroduces the LLM's prompt-injection / hallucination surface *at the hub*.
+- **tools** — *agentic*: a tool-capable hub LLM calls the spokes **as tools**; claymore executes the real spoke
+  queries, feeds the cited results back, and loops to a final answer. One generic `consult_experts` tool by default
+  (claymore fan-out-routes — best for small models), or `tool_style:"per-expert"` for one `ask_<spoke>` tool each.
 
 The hard promise is enforced **in code, not a prompt**: if every spoke abstains, claymore refuses — which survives a
 jailbroken hub LLM. Clients see one OpenAI endpoint regardless of mode.
@@ -70,6 +73,11 @@ Verified against the official OpenAI/Anthropic SDKs:
 - Anthropic: `POST /v1/messages` (content-block response + Anthropic SSE events).
 - `response_format:{type:"json_object"}` → `content` is a JSON string of `{answer, mode, sources:[{spoke,citation}]}`
   for an embedded app to render its own UI.
+- `GET /v1/domains` — the **manifest**: what each spoke covers (so an outer agent / opencode can discover when to
+  call claymore, and use it as a tool).
+
+claymore also *speaks* tool-calling in `mode:"tools"` (it drives a tool-capable LLM that calls the spokes). The
+bounded *spokes* (sgiandubh) have no tools — they answer; tool-calling lives only at the hub.
 
 ## The hub LLM (`mode:"llm"`) — local model OR remote API
 `synthesis.url` is just an endpoint, so either works — switch by config, no rebuild:
