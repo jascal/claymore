@@ -7,10 +7,11 @@
 set -e
 LLAMA=${LLAMA:-$HOME/code/llama.cpp/build/bin/llama-server}
 # Model: by default auto-download from Hugging Face (-hf, cached under ~/.cache/llama.cpp on first run, ~4.7 GB).
-# Qwen2.5-Coder-7B-Instruct Q4_K_M runs well on an 8 GB GPU fully offloaded (-ngl 99) and is reliable at tool-calling.
+# Use bartowski's SINGLE-FILE GGUFs: the official Qwen *-GGUF repos ship SPLIT quants that -hf can fetch
+# incompletely, so the model loads and runs fast but emits garbage. Q4_K_M runs well on an 8 GB GPU at -ngl 99.
 # To use a local .gguf instead, set MODEL=/path/to/model.gguf ; or pick a different repo with HF_REPO=... .
-# Smaller/comfier option for tighter VRAM:  HF_REPO=Qwen/Qwen2.5-Coder-3B-Instruct-GGUF:Q4_K_M
-HF_REPO=${HF_REPO:-Qwen/Qwen2.5-Coder-7B-Instruct-GGUF:Q4_K_M}
+# Smaller/comfier option for tighter VRAM:  HF_REPO=bartowski/Qwen2.5-Coder-3B-Instruct-GGUF:Q4_K_M
+HF_REPO=${HF_REPO:-bartowski/Qwen2.5-Coder-7B-Instruct-GGUF:Q4_K_M}
 MODEL=${MODEL:-}
 SG=${SG:-$HOME/code/sgiandubh}
 HERE="$(cd "$(dirname "$0")/.." && pwd)"

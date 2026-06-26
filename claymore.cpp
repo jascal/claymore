@@ -37,6 +37,7 @@ static std::vector<Spoke> g_spokes;
 static std::string g_mode = "deterministic";
 static int g_top_k = 3;
 static std::string g_tool_style = "generic";      // tools mode: "generic" (one consult_experts tool) | "per-expert"
+static bool g_verbose = false;                     // --verbose / -v: trace the tools loop (tool calls, spoke results, why it refused)
 static json g_synth = json::object();             // {url, model, api_key_env, format:"openai"|"anthropic", max_tokens}
 static const char* REFUSE = "I don't have anything on that in the available material.";
 
@@ -235,8 +236,14 @@ static json llm_turn(const json& messages, const json& tools) {
     req["messages"] = messages;
     if (!tools.empty()) { req["tools"] = tools; req["tool_choice"] = "auto"; }
     auto res = cli.Post(base + "/chat/completions", h, req.dump(), "application/json");
-    if (!res || res->status != 200) return json(nullptr);
-    try { return json::parse(res->body)["choices"][0]["message"]; } catch (...) { return json(nullptr); }
+    if (!res || res->status != 200) {
+        std::string why = res ? ("HTTP " + std::to_string(res->status) + " — " + res->body.substr(0, 300))
+                              : std::string("no response (is the model at the synthesis url up?)");
+        fprintf(stderr, "[claymore] hub LLM call failed: %s\n", why.c_str());  // always: this is the usual cause of a spurious refuse
+        return json(nullptr);
+    }
+    try { return json::parse(res->body)["choices"][0]["message"]; }
+    catch (...) { fprintf(stderr, "[claymore] hub LLM: unparseable response: %s\n", res->body.substr(0, 300).c_str()); return json(nullptr); }
 }
 
 static Result run_tools_loop(const json& client_messages) {
@@ -266,6 +273,7 @@ static Result run_tools_loop(const json& client_messages) {
                 std::string toolres;
                 if (name == "consult_experts") {                              // generic: claymore fan-out-routes
                     auto ranked = fan_out(q);
+                    if (g_verbose) fprintf(stderr, "[claymore] iter %d: consult_experts(query=\"%s\") → %zu non-abstaining spoke(s)\n", it, q.c_str(), ranked.size());
                     if (ranked.empty()) toolres = "(no expert covers that — all abstained)";
                     for (int k = 0; k < (int)ranked.size() && k < g_top_k; k++) {
                         const SAns& a = ranked[k];
@@ -279,6 +287,7 @@ static Result run_tools_loop(const json& client_messages) {
                     for (const auto& s : g_spokes) if (s.name == sn) sp = &s;
                     if (sp) {
                         SAns a = ask_spoke(*sp, q);
+                        if (g_verbose) fprintf(stderr, "[claymore] iter %d: %s(query=\"%s\") → %s\n", it, name.c_str(), q.c_str(), a.ok ? "answered" : "abstained");
                         if (a.ok) {
                             std::string cite = !a.citation.empty() ? a.citation : a.source;
                             toolres = a.answer + (cite.empty() ? "" : ("  (source: " + cite + ")"));
@@ -299,9 +308,15 @@ static Result run_tools_loop(const json& client_messages) {
             continue;                                                        // loop: let the LLM use the results
         }
         r.body = m.value("content", "");                                     // final answer
-        if (r.body.empty()) r.body = REFUSE;
+        if (r.body.empty()) {
+            if (g_verbose) fprintf(stderr, "[claymore] iter %d: model returned no tool call and empty content → refuse\n", it);
+            r.body = REFUSE;
+        } else if (g_verbose) {
+            fprintf(stderr, "[claymore] iter %d: model produced final answer (%zu chars)\n", it, r.body.size());
+        }
         return r;
     }
+    if (g_verbose) fprintf(stderr, "[claymore] hit %d-iteration cap without a final answer → refuse\n", MAX_ITERS);
     r.body = REFUSE;
     r.mode = "abstain";
     return r;                                                                // hit the iteration cap
@@ -456,6 +471,7 @@ int main(int argc, char** argv) {
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         if (a == "--repl") repl = true;
+        else if (a == "--verbose" || a == "-v") g_verbose = true;
         else pos.push_back(a);
     }
     std::string cfg_path = pos.size() > 0 ? pos[0] : "spokes.json";
