@@ -78,6 +78,9 @@ Verified against the official OpenAI/Anthropic SDKs:
   for an embedded app to render its own UI.
 - `GET /v1/domains` — the **manifest**: what each spoke covers (so an outer agent / opencode can discover when to
   call claymore, and use it as a tool).
+- `GET /health` (alias `/healthz`) — live **spoke health**: per-spoke up/down + latency, overall `status`
+  (`ok`/`degraded`/`down`; HTTP 503 if all down). claymore also prints a spoke health report **at startup** (CLI and
+  server), so an unreachable spoke is obvious instead of showing up as silent "nothing covers that" refusals.
 
 claymore also *speaks* tool-calling in `mode:"tools"` (it drives a tool-capable LLM that calls the spokes). The
 bounded *spokes* (sgiandubh) have no tools — they answer; tool-calling lives only at the hub.

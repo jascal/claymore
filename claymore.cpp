@@ -11,6 +11,7 @@
 #include "httplib.h"
 #include "json.hpp"
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
@@ -98,6 +99,27 @@ static std::vector<SAns> fan_out(const std::string& query) {
     for (auto& f : futs) { SAns a = f.get(); if (a.ok) res.push_back(a); }
     std::sort(res.begin(), res.end(), [](const SAns& x, const SAns& y) { return score(x) > score(y); });
     return res;
+}
+
+// Ping each spoke's /v1/models; report up/down + latency. Used at startup (visibility) and the /health endpoint.
+static json spoke_health() {
+    json arr = json::array();
+    for (const auto& sp : g_spokes) {
+        std::string origin, base;
+        split_url(sp.url, origin, base);
+        httplib::Client cli(origin);
+        cli.set_connection_timeout(2);
+        cli.set_read_timeout(3);
+        auto t0 = std::chrono::steady_clock::now();
+        auto res = cli.Get(base + "/v1/models");
+        double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        bool up = res && res->status == 200;
+        json o;
+        o["name"] = sp.name; o["url"] = sp.url; o["domain"] = sp.domain;
+        o["up"] = up; o["latency_ms"] = up ? (int)(ms + 0.5) : -1;
+        arr.push_back(o);
+    }
+    return arr;
 }
 
 // ---- hub LLM (llm mode): local llama.cpp server OR remote API; OpenAI- or Anthropic-shaped ---------------------
@@ -452,6 +474,18 @@ int main(int argc, char** argv) {
     if (g_mode == "tools") extra += " · tools=" + g_tool_style;
     fprintf(stderr, "claymore: %zu spokes · mode=%s%s\n", g_spokes.size(), g_mode.c_str(), extra.c_str());
 
+    // health check at startup — so a down spoke is obvious, not a silent "nothing covers that".
+    json health = spoke_health();
+    int nup = 0;
+    for (const auto& h : health) {
+        bool up = h.value("up", false);
+        if (up) nup++;
+        fprintf(stderr, "  spoke %-10s %-30s %s\n", h.value("name", "").c_str(), h.value("url", "").c_str(),
+                up ? "UP" : "DOWN (unreachable)");
+    }
+    if (nup == 0)
+        fprintf(stderr, "  WARNING: no spokes reachable — start the sgiandubh spoke servers first.\n");
+
     if (repl) {  // CLI: read queries from stdin, print answers (no server) — for manual testing
         fprintf(stderr, "claymore REPL — type a query; blank line or Ctrl-D to exit.\n");
         std::string line;
@@ -482,6 +516,23 @@ int main(int argc, char** argv) {
         json m; m["object"] = "list"; m["data"] = data;
         res.set_content(m.dump(), "application/json");
     });
+    // live spoke health — up/down + latency per spoke; status=degraded if any (or all) are down.
+    auto health_handler = [](const httplib::Request&, httplib::Response& res) {
+        json spokes = spoke_health();
+        int up = 0;
+        for (const auto& s : spokes) if (s.value("up", false)) up++;
+        json m;
+        m["object"] = "health";
+        m["status"] = (up == (int)spokes.size()) ? "ok" : (up > 0 ? "degraded" : "down");
+        m["mode"] = g_mode;
+        m["spokes_up"] = up;
+        m["spokes_total"] = (int)spokes.size();
+        m["spokes"] = spokes;
+        res.status = (up > 0) ? 200 : 503;
+        res.set_content(m.dump(), "application/json");
+    };
+    svr.Get("/health", health_handler);
+    svr.Get("/healthz", health_handler);
     svr.Post("/v1/chat/completions", [](const httplib::Request& q, httplib::Response& r) { handle(q, r, "chat"); });
     svr.Post("/v1/completions", [](const httplib::Request& q, httplib::Response& r) { handle(q, r, "text"); });
     svr.Post("/v1/messages", [](const httplib::Request& q, httplib::Response& r) { handle(q, r, "anthropic"); });
