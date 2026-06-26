@@ -62,6 +62,9 @@ cp spokes.example.json spokes.json                          # edit: list your sp
 Point any OpenAI client at `http://localhost:9000/v1` (or `http://localhost:9000` for an Anthropic client). For the
 `llm` synthesis mode (local llama.cpp or a remote API), see *The hub LLM* below.
 
+**CLI / manual testing:** `./build/claymore spokes.json --repl` — read queries from stdin and print answers, no
+server. Honors the configured mode (deterministic / llm / tools). Handy for quick checks against the hub.
+
 ## Why the abstain-router works
 Every sgiandubh spoke answers only its own material and abstains otherwise, so claymore doesn't need a trained
 router: ask everyone (each call is sub-millisecond), keep whoever didn't abstain. Add a textbook → add a spoke line.

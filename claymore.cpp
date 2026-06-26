@@ -16,6 +16,7 @@
 #include <ctime>
 #include <fstream>
 #include <future>
+#include <iostream>
 #include <string>
 #include <vector>
 using json = nlohmann::json;
@@ -428,8 +429,15 @@ static void handle(const httplib::Request& req, httplib::Response& res, const st
 }
 
 int main(int argc, char** argv) {
-    std::string cfg_path = argc > 1 ? argv[1] : "spokes.json";
-    int port = argc > 2 ? std::stoi(argv[2]) : 9000;
+    std::vector<std::string> pos;
+    bool repl = false;
+    for (int i = 1; i < argc; i++) {
+        std::string a = argv[i];
+        if (a == "--repl") repl = true;
+        else pos.push_back(a);
+    }
+    std::string cfg_path = pos.size() > 0 ? pos[0] : "spokes.json";
+    int port = pos.size() > 1 ? std::stoi(pos[1]) : 9000;
     std::ifstream f(cfg_path);
     if (!f) { fprintf(stderr, "claymore: cannot open %s\n", cfg_path.c_str()); return 1; }
     json cfg; f >> cfg;
@@ -442,9 +450,25 @@ int main(int argc, char** argv) {
     if (g_mode == "llm" || g_mode == "tools")
         extra = " · synth=" + g_synth.value("format", "openai") + "@" + g_synth.value("url", "?");
     if (g_mode == "tools") extra += " · tools=" + g_tool_style;
-    fprintf(stderr, "claymore: %zu spokes · mode=%s%s · listening :%d\n", g_spokes.size(), g_mode.c_str(),
-            extra.c_str(), port);
+    fprintf(stderr, "claymore: %zu spokes · mode=%s%s\n", g_spokes.size(), g_mode.c_str(), extra.c_str());
 
+    if (repl) {  // CLI: read queries from stdin, print answers (no server) — for manual testing
+        fprintf(stderr, "claymore REPL — type a query; blank line or Ctrl-D to exit.\n");
+        std::string line;
+        while (true) {
+            fprintf(stderr, "\n> ");
+            fflush(stderr);
+            if (!std::getline(std::cin, line) || line.empty()) break;
+            Result r = (g_mode == "tools" && !g_synth.value("url", "").empty())
+                           ? run_tools_loop(json::array({json{{"role", "user"}, {"content", line}}}))
+                           : hub_answer(line);
+            printf("%s\n", render_text(r).c_str());
+            fflush(stdout);
+        }
+        return 0;
+    }
+
+    fprintf(stderr, "claymore: listening :%d\n", port);
     httplib::Server svr;
     svr.Get("/v1/models", [](const httplib::Request&, httplib::Response& res) {
         json e; e["id"] = "claymore"; e["object"] = "model"; e["owned_by"] = "claymore";
