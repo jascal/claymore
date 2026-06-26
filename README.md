@@ -37,17 +37,29 @@ Every sgiandubh spoke answers only its own material and abstains otherwise, so c
 router: ask everyone (each call is sub-millisecond), keep whoever didn't abstain. Add a textbook → add a spoke line.
 At large spoke counts, pre-filter by each spoke's `domain` description before fanning out.
 
-## Config (`spokes.json`)
-```json
-{
-  "spokes": [{"name":"riscv","url":"http://localhost:8081","domain":"RISC-V ISA spec"}],
-  "mode": "deterministic",
-  "top_k": 3,
-  "synthesis": {"url":"https://api.openai.com/v1","model":"gpt-4o-mini","api_key_env":"OPENAI_API_KEY"}
-}
+## API surface (drop-in, same as sgiandubh)
+Verified against the official OpenAI/Anthropic SDKs:
+- OpenAI: `POST /v1/chat/completions`, `POST /v1/completions`, `GET /v1/models` (non-stream + SSE `stream:true`).
+- Anthropic: `POST /v1/messages` (content-block response + Anthropic SSE events).
+- `response_format:{type:"json_object"}` → `content` is a JSON string of `{answer, mode, sources:[{spoke,citation}]}`
+  for an embedded app to render its own UI.
+
+## The hub LLM (`mode:"llm"`) — local model OR remote API
+`synthesis.url` is just an endpoint, so either works — switch by config, no rebuild:
+
+```jsonc
+// LOCAL model via llama.cpp (run:  llama-server -m model.gguf --port 8080)  — OpenAI-compatible, no key
+"synthesis": {"url": "http://localhost:8080/v1", "model": "local-model", "format": "openai"}
+
+// REMOTE OpenAI (or any OpenAI-compatible API)
+"synthesis": {"url": "https://api.openai.com/v1", "model": "gpt-4o-mini", "format": "openai", "api_key_env": "OPENAI_API_KEY"}
+
+// REMOTE Anthropic
+"synthesis": {"url": "https://api.anthropic.com", "model": "claude-3-5-haiku-latest", "format": "anthropic", "api_key_env": "ANTHROPIC_API_KEY", "max_tokens": 1024}
 ```
-`mode: "llm"` uses `synthesis` (any OpenAI-compatible endpoint; key read from the named env var). `top_k` bounds how
-many spoke answers feed the synthesizer.
+`format` selects the backend shape (`openai` covers llama.cpp + OpenAI + most; `anthropic` uses `/v1/messages`). Keys
+are read from the named env var (local llama.cpp needs none). `top_k` bounds how many spoke answers feed the
+synthesizer. If the backend is unreachable, claymore falls back to the deterministic cited answer.
 
 ## Guarantee boundary
 Keep the hard promises in claymore (the deterministic gate: all-abstain → refuse; citations carried from spokes), and

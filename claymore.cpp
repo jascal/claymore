@@ -2,14 +2,12 @@
 //
 // Fans a query out to N bounded-expert spokes (each an OpenAI-compatible sgiandubh server), drops the ones that
 // ABSTAIN (off-domain — the bound IS the router), ranks the survivors by confidence, and answers in one of two modes:
+//   deterministic  — return the top cited answer verbatim (keeps every spoke guarantee; no LLM).
+//   llm            — synthesize across the cited answers with a hub LLM (LOCAL llama.cpp server OR a remote API;
+//                    OpenAI- or Anthropic-shaped). If every spoke abstains, claymore refuses IN CODE.
 //
-//   deterministic  — return the top cited answer verbatim. Keeps every spoke guarantee (bounded, cited,
-//                    injection-immune); no LLM in the loop.
-//   llm            — synthesize across the surviving cited answers with a hub LLM (OpenAI-compatible endpoint).
-//                    Flexible/conversational, but reintroduces the LLM's prompt-injection/hallucination surface.
-//
-// The hard promise is enforced IN CODE, not a prompt: if every spoke abstains, claymore refuses — which survives a
-// jailbroken hub LLM. claymore is itself OpenAI-compatible, so clients see one endpoint.
+// claymore exposes the SAME API surface as sgiandubh — OpenAI /v1/chat/completions + /v1/completions + /v1/models,
+// Anthropic /v1/messages, SSE streaming, and response_format json_object — so clients see one drop-in endpoint.
 #include "httplib.h"
 #include "json.hpp"
 #include <algorithm>
@@ -28,11 +26,15 @@ struct SAns {
     double confidence = -1;
     bool ok = false;
 };
+struct Result {                                   // the hub's answer + provenance
+    std::string body, mode;                       // body = answer text (no inline tag); mode = deterministic|llm|abstain
+    std::vector<std::pair<std::string, std::string>> sources;  // (spoke, citation)
+};
 
 static std::vector<Spoke> g_spokes;
 static std::string g_mode = "deterministic";
 static int g_top_k = 3;
-static json g_synth = json::object();   // {url, model, api_key_env}
+static json g_synth = json::object();             // {url, model, api_key_env, format:"openai"|"anthropic", max_tokens}
 static const char* REFUSE = "I don't have anything on that in the available material.";
 
 // split "https://api.openai.com/v1" -> origin "https://api.openai.com", base "/v1"
@@ -50,7 +52,7 @@ static bool is_abstain(const std::string& a, const std::string& kind) {
            a.find("isn't covered") != std::string::npos || a.find("Try rephrasing") != std::string::npos;
 }
 
-// Query one spoke for structured output; ok=false if it abstained / errored (treated as "not this expert").
+// ---- spokes ----------------------------------------------------------------------------------------------------
 static SAns ask_spoke(const Spoke& sp, const std::string& query) {
     SAns r;
     std::string origin, base;
@@ -66,8 +68,8 @@ static SAns ask_spoke(const Spoke& sp, const std::string& query) {
     try {
         std::string content = json::parse(res->body)["choices"][0]["message"]["content"].get<std::string>();
         json a;
-        try { a = json::parse(content); }                       // structured {answer,kind,citation?,source?,confidence?}
-        catch (...) { a = json{{"answer", content}, {"kind", "distilled"}}; }  // spoke didn't honor json → raw text
+        try { a = json::parse(content); }
+        catch (...) { a = json{{"answer", content}, {"kind", "distilled"}}; }
         std::string ans = a.value("answer", ""), kind = a.value("kind", "distilled");
         if (is_abstain(ans, kind)) return r;
         r.answer = ans; r.kind = kind; r.spoke = sp.name;
@@ -80,7 +82,7 @@ static SAns ask_spoke(const Spoke& sp, const std::string& query) {
 
 static double score(const SAns& a) {
     if (a.confidence >= 0) return a.confidence;
-    if (a.kind == "retrieved") return 0.9;          // authoritative verbatim source
+    if (a.kind == "retrieved") return 0.9;
     if (a.kind == "distilled") return 0.6;
     if (a.kind == "generated") return 0.3;
     return 0.5;
@@ -96,44 +98,100 @@ static std::vector<SAns> fan_out(const std::string& query) {
     return res;
 }
 
-static std::string deterministic(const std::vector<SAns>& ranked) {
-    if (ranked.empty()) return REFUSE;
-    const SAns& a = ranked[0];
-    std::string cite = !a.citation.empty() ? a.citation : a.source;
-    return a.answer + (cite.empty() ? ("\n\n[" + a.spoke + "]")
-                                    : ("\n\n\xF0\x9F\x93\x96 " + cite + "  \xC2\xB7  [" + a.spoke + "]"));
+// ---- hub LLM (llm mode): local llama.cpp server OR remote API; OpenAI- or Anthropic-shaped ---------------------
+static std::string call_synth(const std::string& prompt) {
+    std::string origin, base;
+    split_url(g_synth.value("url", ""), origin, base);
+    if (origin.empty()) return "";
+    httplib::Client cli(origin);
+    cli.set_connection_timeout(10);
+    cli.set_read_timeout(120);
+    const char* key = std::getenv(g_synth.value("api_key_env", "OPENAI_API_KEY").c_str());
+    std::string keystr = key ? key : "";                  // local llama.cpp needs no key; the header is harmless
+    if (g_synth.value("format", "openai") == "anthropic") {
+        httplib::Headers h = {{"x-api-key", keystr}, {"anthropic-version", "2023-06-01"}};
+        json req;
+        req["model"] = g_synth.value("model", "claude-3-5-haiku-latest");
+        req["max_tokens"] = g_synth.value("max_tokens", 1024);
+        req["messages"] = json::array({json{{"role", "user"}, {"content", prompt}}});
+        auto res = cli.Post(base + "/v1/messages", h, req.dump(), "application/json");
+        if (!res || res->status != 200) return "";
+        try { return json::parse(res->body)["content"][0]["text"].get<std::string>(); } catch (...) { return ""; }
+    }
+    httplib::Headers h = {{"Authorization", std::string("Bearer ") + keystr}};
+    json req;
+    req["model"] = g_synth.value("model", "gpt-4o-mini");
+    req["messages"] = json::array({json{{"role", "user"}, {"content", prompt}}});
+    auto res = cli.Post(base + "/chat/completions", h, req.dump(), "application/json");  // llama.cpp + OpenAI shape
+    if (!res || res->status != 200) return "";
+    try { return json::parse(res->body)["choices"][0]["message"]["content"].get<std::string>(); } catch (...) { return ""; }
 }
 
-static std::string synthesize(const std::string& query, const std::vector<SAns>& ranked) {
-    if (ranked.empty()) return REFUSE;                          // refuse IN CODE — never call the LLM with nothing
+// ---- modes -----------------------------------------------------------------------------------------------------
+static Result deterministic(const std::vector<SAns>& ranked) {
+    Result r;
+    r.mode = "deterministic";
+    if (ranked.empty()) { r.body = REFUSE; r.mode = "abstain"; return r; }
+    const SAns& a = ranked[0];
+    r.body = a.answer;
+    r.sources.push_back({a.spoke, !a.citation.empty() ? a.citation : a.source});
+    return r;
+}
+
+static Result synthesize(const std::string& query, const std::vector<SAns>& ranked) {
+    if (ranked.empty()) { Result r; r.body = REFUSE; r.mode = "abstain"; return r; }   // refuse before any LLM call
+    Result r;
+    r.mode = "llm";
     std::string excerpts;
     for (int k = 0; k < (int)ranked.size() && k < g_top_k; k++) {
         const SAns& a = ranked[k];
         std::string cite = !a.citation.empty() ? a.citation : a.source;
+        r.sources.push_back({a.spoke, cite});
         excerpts += "[" + a.spoke + "] " + a.answer + (cite.empty() ? "" : ("  (source: " + cite + ")")) + "\n\n";
     }
     std::string prompt = "Answer the question using ONLY the expert excerpts below. Carry their sources in your "
         "answer. Add nothing that is not in them. If they do not cover it, say you don't know.\n\nQuestion: " +
         query + "\n\nExpert excerpts:\n" + excerpts;
-    std::string origin, base;
-    split_url(g_synth.value("url", ""), origin, base);
-    httplib::Client cli(origin);
-    cli.set_connection_timeout(10);
-    cli.set_read_timeout(60);
-    const char* key = std::getenv(g_synth.value("api_key_env", "OPENAI_API_KEY").c_str());
-    httplib::Headers h = {{"Authorization", std::string("Bearer ") + (key ? key : "")}};
-    json req;
-    req["model"] = g_synth.value("model", "gpt-4o-mini");
-    req["messages"] = json::array({json{{"role", "user"}, {"content", prompt}}});
-    auto res = cli.Post(base + "/chat/completions", h, req.dump(), "application/json");
-    if (!res || res->status != 200) return deterministic(ranked);   // hub LLM failed → fall back to deterministic
-    try { return json::parse(res->body)["choices"][0]["message"]["content"].get<std::string>(); }
-    catch (...) { return deterministic(ranked); }
+    std::string out = call_synth(prompt);
+    if (out.empty()) return deterministic(ranked);        // backend unreachable → fall back to the cited answer
+    r.body = out;
+    return r;
 }
 
-static std::string answer(const std::string& query) {
+static Result hub_answer(const std::string& query) {
     auto ranked = fan_out(query);
     return g_mode == "llm" ? synthesize(query, ranked) : deterministic(ranked);
+}
+
+// ---- rendering: text (default) or structured json (response_format) --------------------------------------------
+static std::string render_text(const Result& r) {
+    if (r.mode == "abstain" || r.sources.empty()) return r.body;
+    if (r.mode == "deterministic") {
+        const auto& s = r.sources[0];
+        return r.body + (s.second.empty() ? ("\n\n[" + s.first + "]")
+                                          : ("\n\n\xF0\x9F\x93\x96 " + s.second + "  \xC2\xB7  [" + s.first + "]"));
+    }
+    std::string src = "\n\nSources:";
+    for (auto& s : r.sources) src += " [" + s.first + "]" + (s.second.empty() ? "" : (" " + s.second)) + ";";
+    return r.body + src;
+}
+
+static std::string render_json(const Result& r) {
+    json j;
+    j["answer"] = r.body;
+    j["mode"] = r.mode;
+    json srcs = json::array();
+    for (auto& s : r.sources) { json o; o["spoke"] = s.first; if (!s.second.empty()) o["citation"] = s.second; srcs.push_back(o); }
+    j["sources"] = srcs;
+    return j.dump();
+}
+
+static bool wants_json(const json& body) {
+    if (body.contains("response_format") && body["response_format"].is_object()) {
+        std::string t = body["response_format"].value("type", "");
+        if (t == "json_object" || t == "json_schema" || t == "json") return true;
+    }
+    return body.value("format", "") == "json";
 }
 
 static std::string user_text(const json& body) {
@@ -149,16 +207,101 @@ static std::string user_text(const json& body) {
     return user;
 }
 
+// ---- OpenAI/Anthropic response envelopes (mirror sgiandubh) ----------------------------------------------------
+static json chat_chunk(const json& delta, const char* finish) {
+    json ch; ch["index"] = 0; ch["delta"] = delta; ch["finish_reason"] = finish ? json(finish) : json(nullptr);
+    json c; c["id"] = "chatcmpl-claymore"; c["object"] = "chat.completion.chunk"; c["created"] = (long)std::time(nullptr);
+    c["model"] = "claymore"; c["choices"] = json::array({ch});
+    return c;
+}
 static json chat_completion(const std::string& content) {
-    json choice;
-    choice["index"] = 0;
-    choice["message"] = json{{"role", "assistant"}, {"content", content}};
-    choice["finish_reason"] = "stop";
-    json r;
-    r["id"] = "chatcmpl-claymore"; r["object"] = "chat.completion"; r["created"] = (long)std::time(nullptr);
+    json choice; choice["index"] = 0; choice["message"] = json{{"role", "assistant"}, {"content", content}};
+    choice["finish_reason"] = "stop"; choice["logprobs"] = nullptr;
+    json r; r["id"] = "chatcmpl-claymore"; r["object"] = "chat.completion"; r["created"] = (long)std::time(nullptr);
     r["model"] = "claymore"; r["choices"] = json::array({choice});
     r["usage"] = json{{"prompt_tokens", 0}, {"completion_tokens", 0}, {"total_tokens", 0}};
     return r;
+}
+static json text_completion(const std::string& content) {
+    json choice; choice["index"] = 0; choice["text"] = content; choice["finish_reason"] = "stop"; choice["logprobs"] = nullptr;
+    json r; r["id"] = "cmpl-claymore"; r["object"] = "text_completion"; r["created"] = (long)std::time(nullptr);
+    r["model"] = "claymore"; r["choices"] = json::array({choice});
+    r["usage"] = json{{"prompt_tokens", 0}, {"completion_tokens", 0}, {"total_tokens", 0}};
+    return r;
+}
+static json anthropic_message(const std::string& content) {
+    json block; block["type"] = "text"; block["text"] = content;
+    json r; r["id"] = "msg-claymore"; r["type"] = "message"; r["role"] = "assistant"; r["model"] = "claymore";
+    r["content"] = json::array({block}); r["stop_reason"] = "end_turn"; r["stop_sequence"] = nullptr;
+    r["usage"] = json{{"input_tokens", 0}, {"output_tokens", 0}};
+    return r;
+}
+
+static void stream_answer(httplib::Response& res, std::string route, std::string content) {
+    res.set_chunked_content_provider("text/event-stream",
+        [route, content](size_t, httplib::DataSink& sink) {
+            auto raw = [&](const std::string& s) { sink.write(s.data(), s.size()); };
+            if (route == "anthropic") {
+                json msg; msg["id"] = "msg-claymore"; msg["type"] = "message"; msg["role"] = "assistant";
+                msg["model"] = "claymore"; msg["content"] = json::array(); msg["stop_reason"] = nullptr;
+                msg["usage"] = json{{"input_tokens", 0}, {"output_tokens", 0}};
+                json ms; ms["type"] = "message_start"; ms["message"] = msg;
+                raw("event: message_start\ndata: " + ms.dump() + "\n\n");
+                json cbs; cbs["type"] = "content_block_start"; cbs["index"] = 0;
+                cbs["content_block"] = json{{"type", "text"}, {"text", ""}};
+                raw("event: content_block_start\ndata: " + cbs.dump() + "\n\n");
+            } else if (route == "chat") {
+                raw("data: " + chat_chunk(json{{"role", "assistant"}}, nullptr).dump() + "\n\n");
+            }
+            size_t i = 0;
+            while (i < content.size()) {
+                size_t sp = content.find(' ', i);
+                std::string piece = (sp == std::string::npos) ? content.substr(i) : content.substr(i, sp - i + 1);
+                if (route == "anthropic") {
+                    json d; d["type"] = "content_block_delta"; d["index"] = 0;
+                    d["delta"] = json{{"type", "text_delta"}, {"text", piece}};
+                    raw("event: content_block_delta\ndata: " + d.dump() + "\n\n");
+                } else if (route == "text") {
+                    json ch; ch["text"] = piece; ch["index"] = 0; ch["finish_reason"] = nullptr;
+                    json c; c["id"] = "cmpl-claymore"; c["object"] = "text_completion"; c["created"] = (long)std::time(nullptr);
+                    c["model"] = "claymore"; c["choices"] = json::array({ch});
+                    raw("data: " + c.dump() + "\n\n");
+                } else {
+                    raw("data: " + chat_chunk(json{{"content", piece}}, nullptr).dump() + "\n\n");
+                }
+                i = (sp == std::string::npos) ? content.size() : sp + 1;
+            }
+            if (route == "anthropic") {
+                raw("event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n");
+                json md; md["type"] = "message_delta"; md["delta"] = json{{"stop_reason", "end_turn"}};
+                md["usage"] = json{{"output_tokens", 0}};
+                raw("event: message_delta\ndata: " + md.dump() + "\n\n");
+                raw("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n");
+            } else if (route == "chat") {
+                raw("data: " + chat_chunk(json::object(), "stop").dump() + "\n\n");
+                raw("data: [DONE]\n\n");
+            } else {
+                json ch; ch["text"] = ""; ch["index"] = 0; ch["finish_reason"] = "stop";
+                json c; c["id"] = "cmpl-claymore"; c["object"] = "text_completion"; c["created"] = (long)std::time(nullptr);
+                c["model"] = "claymore"; c["choices"] = json::array({ch});
+                raw("data: " + c.dump() + "\n\n");
+                raw("data: [DONE]\n\n");
+            }
+            sink.done();
+            return true;
+        });
+}
+
+static void handle(const httplib::Request& req, httplib::Response& res, const std::string& route) {
+    json body;
+    try { body = json::parse(req.body); }
+    catch (...) { res.status = 400; res.set_content("{\"error\":\"invalid json\"}", "application/json"); return; }
+    Result r = hub_answer(user_text(body));
+    std::string content = wants_json(body) ? render_json(r) : render_text(r);
+    if (body.value("stream", false)) { stream_answer(res, route, content); return; }
+    if (route == "anthropic") res.set_content(anthropic_message(content).dump(), "application/json");
+    else if (route == "text") res.set_content(text_completion(content).dump(), "application/json");
+    else res.set_content(chat_completion(content).dump(), "application/json");
 }
 
 int main(int argc, char** argv) {
@@ -171,7 +314,9 @@ int main(int argc, char** argv) {
     g_mode = cfg.value("mode", "deterministic");
     g_top_k = cfg.value("top_k", 3);
     g_synth = cfg.value("synthesis", json::object());
-    fprintf(stderr, "claymore: %zu spokes · mode=%s · listening :%d\n", g_spokes.size(), g_mode.c_str(), port);
+    fprintf(stderr, "claymore: %zu spokes · mode=%s%s · listening :%d\n", g_spokes.size(), g_mode.c_str(),
+            g_mode == "llm" ? (" · synth=" + g_synth.value("format", "openai") + "@" + g_synth.value("url", "?")).c_str() : "",
+            port);
 
     httplib::Server svr;
     svr.Get("/v1/models", [](const httplib::Request&, httplib::Response& res) {
@@ -179,14 +324,9 @@ int main(int argc, char** argv) {
         json m; m["object"] = "list"; m["data"] = json::array({e});
         res.set_content(m.dump(), "application/json");
     });
-    auto handle = [](const httplib::Request& req, httplib::Response& res) {
-        json body;
-        try { body = json::parse(req.body); }
-        catch (...) { res.status = 400; res.set_content("{\"error\":\"invalid json\"}", "application/json"); return; }
-        res.set_content(chat_completion(answer(user_text(body))).dump(), "application/json");
-    };
-    svr.Post("/v1/chat/completions", handle);
-    svr.Post("/v1/completions", handle);
+    svr.Post("/v1/chat/completions", [](const httplib::Request& q, httplib::Response& r) { handle(q, r, "chat"); });
+    svr.Post("/v1/completions", [](const httplib::Request& q, httplib::Response& r) { handle(q, r, "text"); });
+    svr.Post("/v1/messages", [](const httplib::Request& q, httplib::Response& r) { handle(q, r, "anthropic"); });
     svr.set_keep_alive_max_count(1000);
     svr.set_keep_alive_timeout(30);
     svr.set_tcp_nodelay(true);
