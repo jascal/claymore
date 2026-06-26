@@ -1,0 +1,13 @@
+{
+  "spokes": [
+    {"name": "riscv", "url": "http://localhost:8081", "domain": "RISC-V ISA specification"},
+    {"name": "logic", "url": "http://localhost:8082", "domain": "formal logic"}
+  ],
+  "mode": "tools",
+  "tool_style": "generic",
+  "synthesis": {
+    "url": "http://localhost:8080/v1",
+    "model": "qwen2.5-coder-7b-instruct",
+    "format": "openai"
+  }
+}

@@ -220,6 +220,14 @@ static Result run_tools_loop(const json& client_messages) {
     Result r;
     r.mode = "tools";
     json msgs = client_messages.is_array() ? client_messages : json::array();
+    // Steer the hub LLM to actually consult the bounded experts (don't answer from its own knowledge) — so answers
+    // stay grounded + cited. Prepended as the first system message; the client's messages follow.
+    json sys = json{{"role", "system"},
+                    {"content", "You must answer using ONLY the expert tool(s) provided. For every question, call "
+                                "the appropriate tool to get a grounded, cited answer, then reply from that result "
+                                "and keep its citation. If the tools return nothing relevant, say the topic isn't "
+                                "covered. Never answer from your own prior knowledge."}};
+    msgs.insert(msgs.begin(), sys);
     json tools = spoke_tools();
     const int MAX_ITERS = 6;
     for (int it = 0; it < MAX_ITERS; it++) {
