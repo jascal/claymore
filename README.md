@@ -23,14 +23,41 @@ jailbroken hub LLM. Clients see one OpenAI endpoint regardless of mode.
                  :8081     :8082     :8083
 ```
 
-## Build & run
+## Getting started (full stack, from scratch)
+
+**Prerequisites** — a C++17 compiler (`g++`); for the **spokes** ([sgiandubh](https://github.com/jascal/sgiandubh)):
+[Soufflé](https://souffle-lang.github.io) + headers, `libsqlite3`, `zlib`, and `python3` with `numpy`/`scipy` (only
+for building grounding vectors); for **claymore**: OpenSSL (optional — only for HTTPS llm-synthesis).
+Debian/Ubuntu: `sudo apt install g++ souffle libsqlite3-dev zlib1g-dev libssl-dev python3-numpy python3-scipy`.
+
+### 1 — a spoke (sgiandubh)
 ```bash
-./build.sh                                   # one binary: build/claymore  (TLS auto-detected for https synthesis)
-cp spokes.example.json spokes.json           # edit: your spokes + mode
-# start your spokes (sgiandubh), then:
-./build/claymore spokes.json 9000
+git clone https://github.com/jascal/sgiandubh && cd sgiandubh
+./build.sh                                                  # → build/sgiandubh (embeds the Datalog engine)
 ```
-Then point any OpenAI client at `http://localhost:9000/v1`.
+Give it a **package** (the expert's data) — copy a prebuilt `package_*/`, or build one. The RISC-V ISA spec needs
+**no model** (grab `norm-rules.json` from the latest
+[riscv-isa-manual release](https://github.com/riscv/riscv-isa-manual/releases)):
+```bash
+python3 tools/normrules2package.py norm-rules.json package_riscv
+python3 tools/build_grounding.py --corpus package_riscv/rules.txt      --out package_riscv --no-split
+python3 tools/build_gram.py      --corpus package_riscv/rules_plain.txt --out package_riscv/gram
+./build/sgiandubh package_riscv 8081 --answer-from-corpus &            # spoke up on :8081
+```
+(See sgiandubh's `WORKFLOW.md` to build experts from your own textbook PDFs / corpora — incl. the model-distilled
+reasoning tier via fieldrun.)
+
+### 2 — the hub (claymore)
+```bash
+git clone https://github.com/jascal/claymore && cd claymore
+./build.sh                                                  # → build/claymore (TLS auto-detected)
+cp spokes.example.json spokes.json                          # edit: list your spokes; set mode
+./build/claymore spokes.json 9000                           # hub up on :9000
+```
+
+### 3 — use it
+Point any OpenAI client at `http://localhost:9000/v1` (or `http://localhost:9000` for an Anthropic client). For the
+`llm` synthesis mode (local llama.cpp or a remote API), see *The hub LLM* below.
 
 ## Why the abstain-router works
 Every sgiandubh spoke answers only its own material and abstains otherwise, so claymore doesn't need a trained
