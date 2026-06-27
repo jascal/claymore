@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Bring up the FULL local stack on a GPU box, no external APIs:
-#   a tool-capable coding model (llama.cpp, on the GPU)  ──tools──▶  claymore  ──fan-out──▶  bounded-expert spokes
+# Bring up the FULL local stack (GPU box or CPU-only box), no external APIs:
+#   a tool-capable coding model (llama.cpp, GPU or CPU)  ──tools──▶  claymore  ──fan-out──▶  bounded-expert spokes
 # Everything talks the OpenAI API; the model calls the experts as tools, claymore runs them, the model finalizes.
 #
 # Edit the paths/model below (or override via env), then:
@@ -11,6 +11,7 @@ set -e
 CLI=0; VERBOSE=${VERBOSE:-}
 for a in "$@"; do case "$a" in --cli) CLI=1 ;; --verbose|-v) VERBOSE=1 ;; esac; done
 LLAMA=${LLAMA:-$HOME/code/llama.cpp/build/bin/llama-server}
+NGL=${NGL:-99}   # GPU layers to offload. Harmless on a CPU box (llama.cpp falls back to CPU); set NGL=0 to be explicit.
 # Model: by default auto-download from Hugging Face (-hf, cached under ~/.cache/llama.cpp on first run, ~4.7 GB).
 # Use bartowski's SINGLE-FILE GGUFs: the official Qwen *-GGUF repos ship SPLIT quants that -hf can fetch
 # incompletely, so the model loads and runs fast but emits garbage. Q4_K_M runs well on an 8 GB GPU at -ngl 99.
@@ -28,8 +29,8 @@ pkill -f "build/sgiandubh"        2>/dev/null || true
 sleep 1
 
 if [ -n "$MODEL" ]; then SRC=(-m "$MODEL"); else SRC=(-hf "$HF_REPO"); fi
-echo "1/3 · coding model on the GPU (CUDA -ngl 99 · tool-calling --jinja) → :8080   [${MODEL:-$HF_REPO}]"
-"$LLAMA" "${SRC[@]}" -ngl 99 -c 8192 --jinja --host 127.0.0.1 --port 8080 >/tmp/llama.log 2>&1 &
+echo "1/3 · coding model (-ngl $NGL requested · --jinja tool-calling) → :8080   [${MODEL:-$HF_REPO}]"
+"$LLAMA" "${SRC[@]}" -ngl "$NGL" -c 8192 --jinja --host 127.0.0.1 --port 8080 >/tmp/llama.log 2>&1 &
 echo "2/3 · bounded-expert spokes → :8081 (riscv), :8082 (logic)"
 "$SG/build/sgiandubh" "$SG/package_riscv" 8081 --answer-from-corpus >/tmp/spoke_riscv.log 2>&1 &
 "$SG/build/sgiandubh" "$SG/package_logic" 8082 --answer-from-corpus >/tmp/spoke_logic.log 2>&1 &
@@ -38,6 +39,14 @@ echo "2/3 · bounded-expert spokes → :8081 (riscv), :8082 (logic)"
 for url in localhost:8080/v1/models localhost:8081/v1/models localhost:8082/v1/models; do
   until curl -s --max-time 3 "$url" >/dev/null 2>&1; do sleep 2; done
 done
+
+# Report ACTUAL model placement — never assume GPU. The build may be CPU/Vulkan/CUDA and -ngl silently falls back to
+# CPU when there's no GPU (e.g. the big CPU box). Read the truth from the load log rather than claiming it.
+off=$(grep -ioE "offloaded [0-9]+/[0-9]+ layers to GPU" /tmp/llama.log 2>/dev/null | tail -1)
+bk=$(grep -ioE "(CUDA|Vulkan|Metal|ROCm|SYCL)" /tmp/llama.log 2>/dev/null | head -1 | tr 'a-z' 'A-Z')
+if [ -n "$off" ]; then echo "      → model placement: ${off}${bk:+ [$bk]}"
+else echo "      → model placement: CPU (no GPU offload)"; fi
+
 if [ "$CLI" = 1 ]; then
   echo "3/3 · claymore CLI (tools mode) — type a query; blank line or Ctrl-D to exit"
   exec "$HERE/build/claymore" "$HERE/examples/local.spokes.json" --repl ${VERBOSE:+--verbose}
