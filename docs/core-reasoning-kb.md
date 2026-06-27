@@ -62,6 +62,43 @@ implementation*, powerful where the domain formalizes and composed with retrieva
 - It pairs with **dynamic-experts**: the build-system reframe (gate the corpus/questions, rebuild) means you rebuild the
   *fact base*; the reasoning is the shared, verified, compiled-in core — never patched.
 
+## Bootstrapping the core KB: propose → verify → admit (answers Q1–Q2)
+Don't hand-author the core, and **don't distill reasoning *questions*** — distilling "What is modus ponens?" memoizes
+the *explanation* (the expert can *recite* the rule, not *apply* it). Instead:
+
+> general reasoning prompts → a model **emits candidate rules in formal syntax** → parse to Datalog → **formally verify
+> soundness** → admit the sound ones to the core.
+
+Model proposes, verifier disposes. The key property: a reasoning rule is a **formal, domain-general object** — its
+soundness is a one-time, machine-checkable proof (modus ponens preserves truth; an unsound proposal fails). So this
+sits in the **proved tier** — no FPR, no feedback loop, unlike *fact*-admission. i-orca is the verifier; the
+elicitation prompts are the only model involvement.
+
+**Use a top-tier frontier model as the author.**
+- The proposal step is exactly where model quality pays — a frontier model drafts more correct, complete, clean-syntax
+  rule sets.
+- **The verification gate means you don't have to trust it** — frontier breadth/quality without its hallucination risk
+  (unsound proposals are rejected by a proof). Untrusted-but-capable generator + trusted formal verifier.
+- **One-time, offline, tiny** — a few dozen general rules authored at build time → frontier cost negligible, amortized
+  across *every* expert forever.
+- **Pay frontier-quality once, cheap-local per domain** — the core is shared and domain-general, so spend the frontier
+  model on the *reasoning* (once) and a cheap local model on each domain's *facts*.
+- **Runtime stays model-free** — the frontier model never touches serving; it authored *verified, compiled-in* rules.
+  Trust comes from the verification, not the model.
+
+**Extract and validate once.** The core is authored, parsed, and formally validated a *single time*, then frozen and
+compiled into every runtime — a **verified reasoning standard library.** Unlike the per-domain fact bases (rebuilt per
+expert; see `dynamic-experts.md`), the core is **immutable and universal**: you verify the reasoning *once*, not per
+expert. That's the clean split — a stable, verified reasoning core + churning, cheap per-domain facts. You don't
+re-verify the standard library per application; you verify it once and link it everywhere.
+
+Discipline: keep verification **formal** (i-orca), not another model — else trust slides back to the frontier model.
+Propose with the frontier model; dispose with a proof.
+
+**Limits:** only formally-*verifiable* proposals enter the proved core — fine for the general logic core (well-defined
+soundness), but *domain-specific* rules need a formal semantics to verify against (else they stay empirical/unadmitted).
+The proposed set also needs minimality/consistency curation (itself formally checkable).
+
 ## Open questions
 1. **Core rule-set scope** — domain-general logic only, or per-family cores (a logic core, a temporal/spec core)? How
    large before it's slow or unsound?
