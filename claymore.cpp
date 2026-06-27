@@ -102,6 +102,41 @@ static std::vector<SAns> fan_out(const std::string& query) {
     return res;
 }
 
+// ---- structured retrieval (aggregation) — call the spoke's /retrieve extension for a SET of cited passages -------
+// This is the hub's standard-tool wrapper over the spoke's non-/v1 /retrieve primitive: the LLM calls a normal
+// tool, claymore turns it into /retrieve calls. For "list / table / all X" queries the single-best path can't serve.
+struct Match { std::string spoke, section, passage; double score = 0; };
+
+static std::vector<Match> retrieve_spoke(const Spoke& sp, const std::string& query,
+                                         const std::string& section, int max) {
+    std::vector<Match> out;
+    std::string origin, base;
+    split_url(sp.url, origin, base);
+    httplib::Client cli(origin);
+    cli.set_connection_timeout(5);
+    cli.set_read_timeout(15);
+    json req{{"query", query}, {"section", section}, {"k", max}};
+    auto res = cli.Post(base + "/retrieve", req.dump(), "application/json");
+    if (!res || res->status != 200) return out;   // spoke lacks /retrieve (older build) or errored → empty
+    try {
+        for (const auto& m : json::parse(res->body).value("matches", json::array()))
+            out.push_back({sp.name, m.value("section", ""), m.value("passage", ""), m.value("score", 0.0)});
+    } catch (...) {}
+    return out;
+}
+
+static std::vector<Match> retrieve_all(const std::string& query, const std::string& section, int max) {
+    std::vector<std::future<std::vector<Match>>> futs;
+    for (const auto& sp : g_spokes)
+        futs.push_back(std::async(std::launch::async, retrieve_spoke, std::cref(sp),
+                                  std::cref(query), std::cref(section), max));
+    std::vector<Match> all;
+    for (auto& f : futs) { auto v = f.get(); all.insert(all.end(), v.begin(), v.end()); }
+    std::sort(all.begin(), all.end(), [](const Match& a, const Match& b) { return a.score > b.score; });
+    if (max > 0 && (int)all.size() > max) all.resize(max);
+    return all;
+}
+
 // Ping each spoke's /v1/models; report up/down + latency. Used at startup (visibility) and the /health endpoint.
 static json spoke_health() {
     json arr = json::array();
@@ -197,6 +232,15 @@ static json query_param() {
                 {"properties", json{{"query", json{{"type", "string"}, {"description", "the question to ask"}}}}},
                 {"required", json::array({"query"})}};
 }
+
+static json list_param() {
+    return json{{"type", "object"},
+                {"properties", json{
+                    {"query", json{{"type", "string"}, {"description", "what to list/enumerate (leave empty to list a whole section)"}}},
+                    {"section", json{{"type", "string"}, {"description", "optional facet to restrict to"}}},
+                    {"max", json{{"type", "integer"}, {"description", "max items to return (default 20)"}}}}},
+                {"required", json::array()}};   // query optional: empty query + a section lists that whole section
+}
 static json spoke_tools() {
     json tools = json::array();
     if (g_tool_style == "per-expert") {                              // one tool per spoke — the LLM picks the expert
@@ -207,17 +251,30 @@ static json spoke_tools() {
                                 ". Returns a cited answer, or indicates it has nothing (abstains).";
             fn["parameters"] = query_param();
             tools.push_back(json{{"type", "function"}, {"function", fn}});
+            json lf;
+            lf["name"] = "list_" + sp.name;
+            lf["description"] = "Retrieve a LIST of matching passages (a cited set) from the " + sp.name +
+                                " expert — for 'list/table/all/which X' questions that want MANY items, not one answer.";
+            lf["parameters"] = list_param();
+            tools.push_back(json{{"type", "function"}, {"function", lf}});
         }
-    } else {                                                         // generic — one tool; claymore fan-out-routes
+    } else {                                                         // generic — claymore fan-out-routes
         std::string domains;
         for (size_t i = 0; i < g_spokes.size(); i++)
             domains += (i ? ", " : "") + g_spokes[i].name + " (" + g_spokes[i].domain + ")";
         json fn;
         fn["name"] = "consult_experts";
-        fn["description"] = "Ask the bounded-expert hub. It routes to whichever expert covers the question and "
-                            "returns a cited answer, or says nothing is covered. Experts: " + domains + ".";
+        fn["description"] = "Ask the bounded-expert hub for a single cited answer. It routes to whichever expert "
+                            "covers the question, or says nothing is covered. Experts: " + domains + ".";
         fn["parameters"] = query_param();
         tools.push_back(json{{"type", "function"}, {"function", fn}});
+        json lf;
+        lf["name"] = "list_matching";
+        lf["description"] = "Retrieve a LIST of matching passages (a cited SET, not one answer) for "
+                            "enumeration/aggregation questions — 'list/table/all/which X'. Use this instead of "
+                            "consult_experts when the user wants MANY items. Optional 'section' restricts to a facet.";
+        lf["parameters"] = list_param();
+        tools.push_back(json{{"type", "function"}, {"function", lf}});
     }
     return tools;
 }
@@ -262,9 +319,30 @@ static Result run_tools_loop(const json& client_messages) {
     const int MAX_ITERS = 6;
     // Execute one tool call (consult_experts fan-out, or a per-expert ask_<spoke>) → the cited result text.
     auto run_tool = [&](const std::string& name, const std::string& argstr) -> std::string {
-        std::string q;
-        try { q = json::parse(argstr).value("query", ""); } catch (...) {}
+        json args; try { args = json::parse(argstr); } catch (...) { args = json::object(); }
+        std::string q = args.value("query", "");
         std::string toolres;
+        // LIST/aggregate tools → the spoke's /retrieve extension, returning a SET of cited passages (not one answer)
+        if (name == "list_matching" || name.rfind("list_", 0) == 0) {
+            std::string section = args.value("section", "");
+            int mx = args.value("max", 20);
+            std::vector<Match> ms;
+            if (name == "list_matching") {
+                ms = retrieve_all(q, section, mx);                        // generic: fan /retrieve to all spokes
+            } else {                                                      // list_<spoke>: one expert
+                std::string sn = name.substr(5);
+                const Spoke* sp = nullptr;
+                for (const auto& s : g_spokes) if (s.name == sn) sp = &s;
+                if (sp) ms = retrieve_spoke(*sp, q, section, mx);
+            }
+            if (g_verbose) fprintf(stderr, "[claymore] %s(query=\"%s\", section=\"%s\") → %zu passage(s)\n", name.c_str(), q.c_str(), section.c_str(), ms.size());
+            if (ms.empty()) return "(no matching passages)";
+            for (const auto& m : ms) {
+                toolres += "- " + m.passage + (m.section.empty() ? "" : ("  (source: " + m.section + ")")) + "\n";
+                r.sources.push_back({m.spoke, m.section});
+            }
+            return toolres;
+        }
         if (name == "consult_experts") {                                  // generic: claymore fan-out-routes
             auto ranked = fan_out(q);
             if (g_verbose) fprintf(stderr, "[claymore] consult_experts(query=\"%s\") → %zu non-abstaining spoke(s)\n", q.c_str(), ranked.size());
