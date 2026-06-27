@@ -128,6 +128,39 @@ cache, and **distillation is the cache-fill**. The cache key is semantic (query 
 
 ---
 
+## Round 2 — converged refinements + two unresolved cruxes
+*(after an external review pass)*
+
+**Converged (adopt):**
+- **Corpus = ground truth; an expert is a *materialized view* over it.** Distillation = view materialization; admission
+  = the view must be derivable from the base table. This is the cleanest statement of the bound.
+- **Machine-readable trust contract** + a `certified_only` query param / endpoint, so downstream agents set policy
+  ("certified for high-stakes, provisional allowed for low").
+- **Staleness via `base_model_version`** — a model update becomes a *re-compilation trigger* (eager re-distill of hot
+  items, or lazy version-mismatch → treat as a miss).
+- **Cost-aware admission** — distill on the Nth distinct miss in a window (or recurrence × savings > fill-cost × k);
+  higher admission bar than a data cache because fills are expensive and ~irreversible.
+
+**Sharpened / corrected:**
+- **Grounding = corpus *support*, not retrieval *reproducibility*.** "Require retrieval to independently reach the same
+  answer" is too strong — if retrieval already reaches it, distillation added nothing; the model's *synthesis beyond
+  retrieval* is the whole value. Gate on **entailment/support by corpus passages**. Measure drift **vs the corpus, not
+  vs the full model** (the model can be wrong or updated).
+
+**Two cruxes still open (the real research):**
+1. **Define "faithful derivation."** A *pure* view over the corpus **is** retrieval (no model). Distillation = view **+
+   model inference**. Grounding gates the *endpoints* (evidence in, citation out) but **not the leap between them** — and
+   "how much inference is a faithful derivation vs a hallucinated leap" is unsolved. This, not the invariant statement,
+   is the load-bearing open problem for bound preservation.
+2. **Spawning needs a corpus.** A dense miss-cluster is by definition off every existing corpus, and provisional
+   full-model answers are **not ground truth** — so a "spawned expert" seeded from them is an *ungrounded memoization
+   cache, not a bounded expert*. Emergent *bounded* experts require **acquiring a corpus** for the new domain, which
+   traffic can't supply. Realistic form: "detect a coherent gap → **flag that a new corpus is needed**," not auto-create.
+
+**Generalization, scoped:** separate *query-level* semantic reuse (paraphrase → nearest distilled answer; feasible now)
+from *decision-level* rule induction reproducing `Σ contrib == logit` (symbolic regression of model internals; likely
+intractable). The near-term path is query-level; decision-level induction stays a long-horizon maybe.
+
 ## Glossary
 - **Bounded expert** — a model-free runtime that answers only its material and abstains elsewhere; the abstain is
   structural, not a filter.
