@@ -260,6 +260,55 @@ static Result run_tools_loop(const json& client_messages) {
     msgs.insert(msgs.begin(), sys);
     json tools = spoke_tools();
     const int MAX_ITERS = 6;
+    // Execute one tool call (consult_experts fan-out, or a per-expert ask_<spoke>) → the cited result text.
+    auto run_tool = [&](const std::string& name, const std::string& argstr) -> std::string {
+        std::string q;
+        try { q = json::parse(argstr).value("query", ""); } catch (...) {}
+        std::string toolres;
+        if (name == "consult_experts") {                                  // generic: claymore fan-out-routes
+            auto ranked = fan_out(q);
+            if (g_verbose) fprintf(stderr, "[claymore] consult_experts(query=\"%s\") → %zu non-abstaining spoke(s)\n", q.c_str(), ranked.size());
+            if (ranked.empty()) toolres = "(no expert covers that — all abstained)";
+            for (int k = 0; k < (int)ranked.size() && k < g_top_k; k++) {
+                const SAns& a = ranked[k];
+                std::string cite = !a.citation.empty() ? a.citation : a.source;
+                toolres += "[" + a.spoke + "] " + a.answer + (cite.empty() ? "" : ("  (source: " + cite + ")")) + "\n";
+                r.sources.push_back({a.spoke, cite});
+            }
+        } else {                                                          // per-expert: ask_<spoke>
+            std::string sn = (name.rfind("ask_", 0) == 0) ? name.substr(4) : name;
+            const Spoke* sp = nullptr;
+            for (const auto& s : g_spokes) if (s.name == sn) sp = &s;
+            if (sp) {
+                SAns a = ask_spoke(*sp, q);
+                if (g_verbose) fprintf(stderr, "[claymore] %s(query=\"%s\") → %s\n", name.c_str(), q.c_str(), a.ok ? "answered" : "abstained");
+                if (a.ok) {
+                    std::string cite = !a.citation.empty() ? a.citation : a.source;
+                    toolres = a.answer + (cite.empty() ? "" : ("  (source: " + cite + ")"));
+                    r.sources.push_back({sp->name, cite});
+                } else {
+                    toolres = "(the " + sn + " expert has nothing on that — abstained)";
+                }
+            } else {
+                toolres = "(unknown tool: " + name + ")";
+            }
+        }
+        return toolres;
+    };
+    // Some local models emit the tool call as plain JSON text in `content` rather than the structured tool_calls field
+    // (llama.cpp doesn't always parse it, even with --jinja). Pull {name, arguments} out of the text so we run it anyway.
+    auto as_text_toolcall = [](const std::string& s, std::string& name, std::string& argstr) -> bool {
+        auto a = s.find('{'), b = s.rfind('}');                           // tolerate <tool_call> tags / surrounding prose
+        if (a == std::string::npos || b == std::string::npos || b <= a) return false;
+        try {
+            json j = json::parse(s.substr(a, b - a + 1));
+            if (!j.is_object() || !j.contains("name")) return false;
+            name = j.value("name", "");
+            const json& args = j.contains("arguments") ? j["arguments"] : (j.contains("parameters") ? j["parameters"] : json::object());
+            argstr = args.is_string() ? args.get<std::string>() : args.dump();
+            return !name.empty();
+        } catch (...) { return false; }
+    };
     for (int it = 0; it < MAX_ITERS; it++) {
         json m = llm_turn(msgs, tools);
         if (m.is_null()) { r.body = REFUSE; r.mode = "abstain"; return r; }   // backend unreachable
@@ -268,46 +317,27 @@ static Result run_tools_loop(const json& client_messages) {
             for (const auto& tc : m["tool_calls"]) {
                 std::string name = tc.value("function", json::object()).value("name", "");
                 std::string argstr = tc.value("function", json::object()).value("arguments", "{}");
-                std::string q;
-                try { q = json::parse(argstr).value("query", ""); } catch (...) {}
-                std::string toolres;
-                if (name == "consult_experts") {                              // generic: claymore fan-out-routes
-                    auto ranked = fan_out(q);
-                    if (g_verbose) fprintf(stderr, "[claymore] iter %d: consult_experts(query=\"%s\") → %zu non-abstaining spoke(s)\n", it, q.c_str(), ranked.size());
-                    if (ranked.empty()) toolres = "(no expert covers that — all abstained)";
-                    for (int k = 0; k < (int)ranked.size() && k < g_top_k; k++) {
-                        const SAns& a = ranked[k];
-                        std::string cite = !a.citation.empty() ? a.citation : a.source;
-                        toolres += "[" + a.spoke + "] " + a.answer + (cite.empty() ? "" : ("  (source: " + cite + ")")) + "\n";
-                        r.sources.push_back({a.spoke, cite});
-                    }
-                } else {                                                       // per-expert: ask_<spoke>
-                    std::string sn = (name.rfind("ask_", 0) == 0) ? name.substr(4) : name;
-                    const Spoke* sp = nullptr;
-                    for (const auto& s : g_spokes) if (s.name == sn) sp = &s;
-                    if (sp) {
-                        SAns a = ask_spoke(*sp, q);
-                        if (g_verbose) fprintf(stderr, "[claymore] iter %d: %s(query=\"%s\") → %s\n", it, name.c_str(), q.c_str(), a.ok ? "answered" : "abstained");
-                        if (a.ok) {
-                            std::string cite = !a.citation.empty() ? a.citation : a.source;
-                            toolres = a.answer + (cite.empty() ? "" : ("  (source: " + cite + ")"));
-                            r.sources.push_back({sp->name, cite});
-                        } else {
-                            toolres = "(the " + sn + " expert has nothing on that — abstained)";
-                        }
-                    } else {
-                        toolres = "(unknown tool: " + name + ")";
-                    }
-                }
+                if (g_verbose) fprintf(stderr, "[claymore] iter %d: tool_call %s\n", it, name.c_str());
                 json tm;
                 tm["role"] = "tool";
                 tm["tool_call_id"] = tc.value("id", "");
-                tm["content"] = toolres;
+                tm["content"] = run_tool(name, argstr);
                 msgs.push_back(tm);
             }
             continue;                                                        // loop: let the LLM use the results
         }
-        r.body = m.value("content", "");                                     // final answer
+        std::string content = m.value("content", "");
+        std::string tname, targs;
+        if (as_text_toolcall(content, tname, targs)) {                       // tool call emitted as TEXT — run it anyway
+            if (g_verbose) fprintf(stderr, "[claymore] iter %d: model emitted a tool call as text (%s); executing it\n", it, tname.c_str());
+            std::string toolres = run_tool(tname, targs);
+            msgs.push_back(m);                                                // the assistant text turn
+            msgs.push_back(json{{"role", "user"},
+                                {"content", "Expert tool results:\n" + toolres +
+                                            "\nNow answer my question using ONLY these results, and keep the citation. Do not call the tool again."}});
+            continue;
+        }
+        r.body = content;                                                    // final answer
         if (r.body.empty()) {
             if (g_verbose) fprintf(stderr, "[claymore] iter %d: model returned no tool call and empty content → refuse\n", it);
             r.body = REFUSE;

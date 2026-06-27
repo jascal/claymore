@@ -21,6 +21,12 @@ MODEL=${MODEL:-}
 SG=${SG:-$HOME/code/sgiandubh}
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
 
+# Stop any previous stack first — a leftover llama-server hogs the GPU (→ OOM on the new one) and old spokes hold the
+# ports. (|| true so set -e doesn't abort when there's nothing to kill.)
+pkill -f "build/bin/llama-server" 2>/dev/null || true
+pkill -f "build/sgiandubh"        2>/dev/null || true
+sleep 1
+
 if [ -n "$MODEL" ]; then SRC=(-m "$MODEL"); else SRC=(-hf "$HF_REPO"); fi
 echo "1/3 · coding model on the GPU (CUDA -ngl 99 · tool-calling --jinja) → :8080   [${MODEL:-$HF_REPO}]"
 "$LLAMA" "${SRC[@]}" -ngl 99 -c 8192 --jinja --host 127.0.0.1 --port 8080 >/tmp/llama.log 2>&1 &
