@@ -65,3 +65,27 @@ that number *valid* under live, possibly-adversarial traffic with a feedback loo
 **Q5.** If checking entailment is reliably easier than generating, the empirical tier is buildable and its soundness is
 boundable. If not, only the *proved* tier is real — which would sharply narrow where the whole self-distilling loop is
 safe to run. Everything else here is engineering around that answer.
+
+## Round 2 — Q5 resolved, Q6 dissolved
+
+**Q5 — the asymmetry ≈ extractive-vs-inferential depth.** The verifier–generator gap for entailment tracks the *claim's
+inferential depth*: it's large where entailment reduces to **alignment** (answer ~present in a passage — recognition,
+not production) and collapses to zero where checking means **redoing the generative reasoning** (multi-hop, scoping,
+quantifiers, world knowledge). So scope is *principled*, not just measured: the empirical tier is sound for
+**low-inferential-depth claims**; deep-inference claims have no asymmetry → provisional, or formalize (proved).
+
+**The corollary (the bite):** extractive claims are exactly what plain **retrieval already serves**, so where the
+empirical gate is soundest, distillation adds least; where distillation adds most (genuine synthesis), the gate is least
+sound. The empirical-distilled tier's real home is a **narrow band — *shallow* inference** (light paraphrase /
+single-hop combine / simple aggregation). **Deep synthesis can only be safely certified via the proved tier** — which is
+therefore where the real power lives, not a fallback.
+
+**Q6 dissolved structurally — raw-corpus-only grounding (provenance depth 0).** Forbid admitted items from serving as
+evidence for later admissions: every admission must be entailed by *raw corpus* passages only. Then no admission depends
+on another → no compounding chain → **self-poisoning impossible by construction**, and per-item FPR composes
+independently. Cost: no transitive build-up — the right trade for a bounded core.
+
+**Adopt:** refutation / default-reject as the checker's posture; mixed-*family* ensemble as the realistic ceiling
+(sub-linear, not geometric, FPR drop — same-base ensembles are correlated); conformal as a per-claim-type *upper bound*
+with drift-triggered re-calibration; atomic decomposition + a faithfulness check (the atomic conjunction reconstructs
+the original meaning); scope-by-measurement, starting conservative and expanding only on evidence.

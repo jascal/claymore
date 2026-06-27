@@ -161,6 +161,29 @@ cache, and **distillation is the cache-fill**. The cache key is semantic (query 
 from *decision-level* rule induction reproducing `Σ contrib == logit` (symbolic regression of model internals; likely
 intractable). The near-term path is query-level; decision-level induction stays a long-horizon maybe.
 
+## Converged design (after the crux rounds)
+The exploration has reached a stable resting point: safety reduces to **structural constraints + one measured quantity**.
+
+- **Admission requires corpus-entailment** ⇒ bound erosion is impossible by construction; growth asymptotes to the
+  corpus's recall ceiling, never beyond. Misses auto-partition: *recall miss* → admit, *coverage gap* → provisional
+  (closed only by adding to the corpus).
+- **Raw-corpus-only grounding (provenance depth 0)** ⇒ no admission depends on another ⇒ self-poisoning impossible;
+  per-item FPR composes independently.
+- **RAG-over-corpus fallback** (not parametric) ⇒ there is evidence to entail against.
+- **Three tiers, by what can be certified:**
+  - **proved** — formal entailment over a structured shadow (formalizable domains / claim fragments; e.g. RISC-V from
+    `norm-rules`). Sound by construction; **the only tier that can safely certify deep synthesis.**
+  - **empirical** — NL-entailment gate, sound only for the **shallow-inference band** (light paraphrase / single-hop
+    combine / aggregation); scope earned *per claim type* by a **measured FPR + confidence bound**; refutation /
+    default-reject posture.
+  - **provisional** — full-model fallback; everything uncovered or uncertifiable; always answers, never certified.
+- **Evolution:** as structured-shadow coverage grows, empirical claims graduate to proved.
+
+**Build implication.** The safest, highest-value first slice is the **proved gate on RISC-V** (the structured shadow
+already exists as `norm-rules`) + **provisional** everywhere else; the **empirical** tier is added later, per claim
+type, behind a measurement harness. Detail in [`crux1-certified-admission.md`](./crux1-certified-admission.md) and
+[`crux1b-empirical-soundness.md`](./crux1b-empirical-soundness.md).
+
 ## Glossary
 - **Bounded expert** — a model-free runtime that answers only its material and abstains elsewhere; the abstain is
   structural, not a filter.
