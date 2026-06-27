@@ -26,12 +26,14 @@ using json = nlohmann::json;
 
 struct Spoke { std::string name, url, domain; };
 struct SAns {
-    std::string answer, kind, citation, source, spoke;
+    std::string answer, kind, citation, source, spoke, route;  // route: RETRIEVED|SELECTED|COMPOSED provenance tier
     double confidence = -1;
+    double margin = 1e9;                           // thinnest-decision margin (1e9 = absent) — fragile-link signal
     bool ok = false;
 };
 struct Result {                                   // the hub's answer + provenance
-    std::string body, mode;                       // body = answer text (no inline tag); mode = deterministic|llm|abstain
+    std::string body, mode, route;                // body = answer text (no inline tag); mode = deterministic|llm|abstain
+    double margin = 1e9;
     std::vector<std::pair<std::string, std::string>> sources;  // (spoke, citation)
 };
 
@@ -105,6 +107,8 @@ static SAns ask_spoke(const Spoke& sp, const std::string& query) {
         if (is_abstain(ans, kind)) return r;
         r.answer = ans; r.kind = kind; r.spoke = sp.name;
         r.citation = a.value("citation", ""); r.source = a.value("source", "");
+        r.route = a.value("route", "");
+        if (a.contains("margin") && a["margin"].is_number()) r.margin = a["margin"].get<double>();
         if (a.contains("confidence") && a["confidence"].is_number()) r.confidence = a["confidence"].get<double>();
         r.ok = true;
         // Relevance = best of (query↔response) and (query↔spoke domain). The domain term keeps a legit in-domain query
@@ -231,6 +235,7 @@ static Result deterministic(const std::vector<SAns>& ranked) {
     if (ranked.empty()) { r.body = REFUSE; r.mode = "abstain"; return r; }
     const SAns& a = ranked[0];
     r.body = a.answer;
+    r.route = a.route; r.margin = a.margin;          // carry the spoke's provenance tier + fragile-link margin
     r.sources.push_back({a.spoke, !a.citation.empty() ? a.citation : a.source});
     return r;
 }
@@ -486,8 +491,16 @@ static std::string render_text(const Result& r) {
     if (r.mode == "abstain" || r.sources.empty()) return r.body;
     if (r.mode == "deterministic") {
         const auto& s = r.sources[0];
-        return r.body + (s.second.empty() ? ("\n\n[" + s.first + "]")
+        std::string out = r.body + (s.second.empty() ? ("\n\n[" + s.first + "]")
                                           : ("\n\n\xF0\x9F\x93\x96 " + pretty_cite(s.second) + "  \xC2\xB7  [" + s.first + "]"));
+        if (!r.route.empty() || r.margin < 1e8) {     // carry the spoke's provenance tier (recall vs forge-tax)
+            char mb[64];
+            if (!r.route.empty() && r.margin < 1e8) snprintf(mb, sizeof mb, "%s · margin %+.2f", r.route.c_str(), r.margin);
+            else if (!r.route.empty()) snprintf(mb, sizeof mb, "%s", r.route.c_str());
+            else snprintf(mb, sizeof mb, "margin %+.2f", r.margin);
+            out += "\n[provenance: " + std::string(mb) + "]";
+        }
+        return out;
     }
     // dedupe + pretty-print + collapse the noise (e.g. [logic] repeated 20x with no citation). Prefer cited entries;
     // if none carry a citation, list the distinct spokes once.
@@ -515,6 +528,8 @@ static std::string render_json(const Result& r) {
     json srcs = json::array();
     for (auto& s : r.sources) { json o; o["spoke"] = s.first; if (!s.second.empty()) o["citation"] = s.second; srcs.push_back(o); }
     j["sources"] = srcs;
+    if (!r.route.empty()) j["route"] = r.route;       // provenance tier (RETRIEVED|SELECTED|COMPOSED)
+    if (r.margin < 1e8) j["margin"] = r.margin;       // thinnest-decision margin (fragile-link signal)
     return j.dump();
 }
 
