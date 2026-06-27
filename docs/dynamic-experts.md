@@ -193,6 +193,41 @@ Where the crux analysis still applies: **extraction-time grounding** (the RAG st
 (proved / empirical / provisional still describe how much to trust an answer). What dissolves: incremental insertion
 into the certified core.
 
+### The RAG-over-corpus extraction change (the one engine-side piece)
+Today `fieldrun --export-logic-corpus` distills the model's answer **from its parameters** — the question goes in, the
+model answers from memory, and `build_grounding` staples the nearest passage on *afterward*. Answer and corpus are
+decoupled, so the model can hallucinate and grounding just attaches a plausible citation (this is why the 0.5B proof
+distill said "RVWMO was designed by ARM Holdings"). The change: **put the retrieved corpus passages in the model's
+prompt at distill time** and instruct "answer only from these; if not covered, say so."
+
+| | now (parametric) | RAG-extraction |
+|---|---|---|
+| Prompt | just the question | retrieved passages + question + "answer only from these" |
+| Answer comes from | model weights | the corpus |
+| Citation | post-hoc nearest staple | the passages the model actually used |
+| Coverage gap | model bluffs | retrieval empty → model abstains → no certified item |
+
+This is what makes the reframe's guarantees concrete: answers are **grounded by construction**, **coverage-gaps
+self-exclude at build time**, and the whole extraction is **coherent** (every answer derives from one corpus). The
+certificate is unchanged in form (`Σ contrib == logit`); it now certifies "the model, *given these passages*, produced
+this."
+
+**There is no RAG database — "RAG" is used loosely here.** The retriever is what sgiandubh already has: `knowledge.tsv`
+(the passages) + `wordvec.txt` (GloVe word vectors) → one **mean-pooled vector per passage**, computed in memory, with
+**brute-force cosine** (a linear scan). At these corpus sizes (~1–3k passages) that's microseconds; a vector DB buys
+nothing until ~10⁵–10⁶ passages. Two notes:
+- The runtime retriever is *weak* (mean-pooled GloVe — a similarity floor), but **extraction is offline**, so the
+  distill-time RAG step may use a *stronger* retriever (BM25, or a real embedding model) to pick the in-context
+  passages — none of it ships into the spoke, which stays model-free (the grounded answer is baked into the item).
+- **Honest boundary:** RAG-extraction makes answers *corpus-conditioned* (grounded in practice, hallucination drops
+  sharply) — it is **not** a corpus-entailment *proof* (the model can still misread a passage). It's the cheap baseline
+  grounding; the **proved tier** (formal entailment) sits on top for the formalizable slice where a guarantee is wanted.
+
+**Realization:** almost all of it lives *outside* fieldrun — a small `rag_prompts.py` pre-step reads `questions.txt` +
+the corpus, retrieves per question (reusing the cosine retriever, or a stronger build-time one), and writes assembled
+prompts; fieldrun distills them as-is. The only engine-side need is accepting **context-bearing (multi-line) prompts**
+rather than one-line-per-prompt — a format accommodation, not retrieval logic in the engine.
+
 ## Converged design (after the crux rounds)
 *(Read under the reframe above: "admission" = gating a corpus/question update, then rebuilding — not patching the
 Datalog.)* Safety reduces to **structural constraints + one measured quantity**.
