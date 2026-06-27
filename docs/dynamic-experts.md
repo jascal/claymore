@@ -161,8 +161,41 @@ cache, and **distillation is the cache-fill**. The cache key is semantic (query 
 from *decision-level* rule induction reproducing `Σ contrib == logit` (symbolic regression of model internals; likely
 intractable). The near-term path is query-level; decision-level induction stays a long-horizon maybe.
 
+## The deciding reframe: gate the source, rebuild the artifact (don't patch the Datalog)
+*The key simplification — it supersedes the "admit answers into the expert" framing above.*
+
+Updating a partially-extracted expert is **the same operation as extracting it in the first place**. So don't treat
+the dynamic loop as online learning (safely patch the certified Datalog); treat it as a **build system**:
+
+> **expert = extract(corpus, questions, model)** — a pure function. Never hand-edit the compiled artifact; change the
+> source and **rebuild the whole expert.**
+
+Consequences:
+- **The fallback answer is never certified content** — it's only a *signal that a gap exists*. So self-poisoning can't
+  happen (nothing is patched) and the per-answer corpus-entailment gate evaporates. (The crux #1/#1b analysis was
+  solving the wrong problem; it *relocates* — see below — rather than being wasted.)
+- **Two gates, relocated and simpler:**
+  - *Question-set gate (curriculum):* "is this query worth distilling?" Low-risk — it only spends extraction compute;
+    the answer comes from re-extraction, not the fallback. The recurrence/cost policy lives here now.
+  - *Corpus gate (ground truth):* "should this source enter the corpus?" High-bar, and **not the model's answer**
+    (ungrounded). Recall miss → no corpus change; coverage gap → needs *authoritative source* (human/curated). This is
+    where human-in-the-loop belongs, and it's a tiny surface vs gating every answer.
+- **Grounded by construction:** the extraction step should be **RAG-over-corpus** — the model answers each curriculum
+  question *using the corpus*, so every distilled answer is synthesized from the source (this is the contained change to
+  `fieldrun --export-logic-corpus`). Then recall-misses fill grounded; coverage-gaps **abstain at extraction** (no
+  passages exist) → stay provisional until the corpus is extended. The model's parametric guess never leaks in, and
+  coherence falls out of the **holistic re-extraction over the whole corpus + question set** (bigger corpus + more
+  questions → more coherent extraction).
+- **Cadence:** rebuild is a **batch compile** (nightly / when the gated-update queue justifies it); provisional-full-
+  model serves in between. CI/CD for experts: misses are bug reports, gating is triage, rebuild is the nightly.
+
+Where the crux analysis still applies: **extraction-time grounding** (the RAG step) and the **answer trust tiers**
+(proved / empirical / provisional still describe how much to trust an answer). What dissolves: incremental insertion
+into the certified core.
+
 ## Converged design (after the crux rounds)
-The exploration has reached a stable resting point: safety reduces to **structural constraints + one measured quantity**.
+*(Read under the reframe above: "admission" = gating a corpus/question update, then rebuilding — not patching the
+Datalog.)* Safety reduces to **structural constraints + one measured quantity**.
 
 - **Admission requires corpus-entailment** ⇒ bound erosion is impossible by construction; growth asymptotes to the
   corpus's recall ceiling, never beyond. Misses auto-partition: *recall miss* → admit, *coverage gap* → provisional
