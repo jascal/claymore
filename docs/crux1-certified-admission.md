@@ -55,6 +55,31 @@ auditable-by-construction rather than confidence-thresholded.
    passage quoted out of context, a corpus that is itself wrong, or an atomic-claim decomposition that loses a
    cross-claim dependency? Is "the corpus is ground truth" an assumption that needs its own audit?
 
+## Round 2 — a correction and a reframe
+
+**Reframe (the prize): a *sound* corpus-entailment gate makes bound erosion impossible, not merely mitigated.**
+If admission *requires* corpus-entailment, every admitted item is corpus-grounded by definition, so the expert can only
+grow *within the corpus's support* — never into the model's broader knowledge. The problem reduces from "define
+faithful derivation" to **"how sound is the entailment check, per tier"** (formal = sound by construction → *proved*;
+NL = soft, nonzero false-positive rate → *empirical*). A clean property falls out — the gate auto-partitions misses:
+- **recall miss** — corpus has it, the expert missed it → entailable → **admit** (growth fills recall gaps);
+- **coverage gap** — corpus lacks it → nothing entails it → **provisional forever** (correct: never bound-admit what
+  the corpus can't support).
+So dynamic growth asymptotes to *everything the corpus entails* (the recall ceiling) and **never beyond** — boundedness
+by construction. A true coverage gap is closed only by *adding to the corpus* (→ crux #2).
+
+**Correction: the "attribution bridge" misreads the certificate.** `Σ contrib == logit` decomposes into model-internal
+**blocks** (residual-stream components), not corpus passages — and in the fallback the model usually answers
+**parametrically** (no passages in context), so there is nothing to bridge to. The bridge is recoverable only if the
+fallback is **RAG-over-the-corpus** *and* you compute **input-position attribution** (derivable by path expansion, not
+the block-level certificate as emitted). This forces an explicit design choice: **does the fallback answer
+parametrically or via RAG over the corpus?** Given the partition above, RAG-over-corpus is the coherent choice (a
+parametric answer to a true coverage gap is unadmittable anyway).
+
+**Adopt:** minimal-supporting-sub-corpus (evidence selection; the entailment *check* remains the hard part), structured
+shadow + certified reduction for the proved tier, `corpus_version`/`last_corpus_audit` in the trust contract, scope
+annotations on passages used in proved derivations.
+
 ## Why this matters here specifically
 Most RAG/agent systems gate on *confidence*, which optimizes for "the model is sure" — exactly when it is confidently
 wrong. We already have certification machinery for model decisions; the prize is extending it to **certify the
