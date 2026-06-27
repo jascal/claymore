@@ -70,6 +70,12 @@ Every sgiandubh spoke answers only its own material and abstains otherwise, so c
 router: ask everyone (each call is sub-millisecond), keep whoever didn't abstain. Add a textbook → add a spoke line.
 At large spoke counts, pre-filter by each spoke's `domain` description before fanning out.
 
+**Relevance gate (defense-in-depth).** Spoke abstain isn't perfect, so claymore also drops any response whose overlap
+with the query is below `--min-relevance` (default 0.10, lexical) *before* it's cited or fed to the LLM — e.g. a
+RISC-V vector rule returned for "predicate calculus" gets dropped, so it never pollutes the answer or the sources.
+This is a cheap backstop, **not** a substitute for spoke abstain (a spoke queried directly still abstains on its own);
+it only catches egregiously off-topic responses, and it's tunable.
+
 ## API surface (drop-in, same as sgiandubh)
 Verified against the official OpenAI/Anthropic SDKs:
 - OpenAI: `POST /v1/chat/completions`, `POST /v1/completions`, `GET /v1/models` (non-stream + SSE `stream:true`).

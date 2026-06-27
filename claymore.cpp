@@ -11,6 +11,7 @@
 #include "httplib.h"
 #include "json.hpp"
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -18,6 +19,7 @@
 #include <fstream>
 #include <future>
 #include <iostream>
+#include <set>
 #include <string>
 #include <vector>
 using json = nlohmann::json;
@@ -38,6 +40,7 @@ static std::string g_mode = "deterministic";
 static int g_top_k = 3;
 static std::string g_tool_style = "generic";      // tools mode: "generic" (one consult_experts tool) | "per-expert"
 static bool g_verbose = false;                     // --verbose / -v: trace the tools loop (tool calls, spoke results, why it refused)
+static double g_min_relevance = 0.10;              // --min-relevance: drop a spoke response sharing < this fraction (Jaccard) with the query
 static json g_synth = json::object();             // {url, model, api_key_env, format:"openai"|"anthropic", max_tokens}
 static const char* REFUSE = "I don't have anything on that in the available material.";
 
@@ -54,6 +57,30 @@ static void split_url(const std::string& url, std::string& origin, std::string& 
 static bool is_abstain(const std::string& a, const std::string& kind) {
     return kind == "abstain" || a.empty() ||
            a.find("isn't covered") != std::string::npos || a.find("Try rephrasing") != std::string::npos;
+}
+
+// Hub-side relevance gate (defense-in-depth, NOT a substitute for spoke abstain): how much of the query's content
+// overlaps the response (answer + citation). A near-zero overlap means the spoke returned something off-topic even
+// though it didn't abstain (e.g. a RISC-V vector rule for "predicate calculus") — drop it before citing/synthesizing.
+// Lexical + conservative by design: it only catches the egregious cases; the spoke + the LLM remain the real filters.
+static std::set<std::string> content_words(const std::string& s) {
+    static const std::set<std::string> STOP = {
+        "the","is","are","was","were","be","been","a","an","of","to","in","on","for","and","or","but","what","which",
+        "who","how","why","when","where","do","does","did","you","your","it","its","that","this","these","those",
+        "with","as","at","by","from","about","can","could","would","should","i","we","me","my","please","explain",
+        "list","give","tell","get","all","any","some","there"};
+    std::set<std::string> w; std::string cur;
+    auto flush = [&] { if (cur.size() > 1 && !STOP.count(cur)) w.insert(cur); cur.clear(); };
+    for (char c : s) { if (std::isalnum((unsigned char)c)) cur += (char)std::tolower((unsigned char)c); else flush(); }
+    flush();
+    return w;
+}
+static double relevance(const std::string& query, const std::string& response) {
+    auto q = content_words(query), r = content_words(response);
+    if (q.empty()) return 1.0;                          // no content words to judge → don't gate
+    size_t inter = 0;
+    for (const auto& x : q) if (r.count(x)) inter++;
+    return (double)inter / (double)(q.size() + r.size() - inter);   // Jaccard
 }
 
 // ---- spokes ----------------------------------------------------------------------------------------------------
@@ -80,6 +107,11 @@ static SAns ask_spoke(const Spoke& sp, const std::string& query) {
         r.citation = a.value("citation", ""); r.source = a.value("source", "");
         if (a.contains("confidence") && a["confidence"].is_number()) r.confidence = a["confidence"].get<double>();
         r.ok = true;
+        if (relevance(query, r.answer + " " + r.citation + " " + r.source) < g_min_relevance) {
+            if (g_verbose) fprintf(stderr, "[claymore] dropped %s response (relevance < %.2f — off-topic for the query)\n",
+                                   sp.name.c_str(), g_min_relevance);
+            r.ok = false;                               // hub relevance gate: backstop for a spoke that didn't abstain
+        }
     } catch (...) { return r; }
     return r;
 }
@@ -580,6 +612,7 @@ int main(int argc, char** argv) {
         std::string a = argv[i];
         if (a == "--repl") repl = true;
         else if (a == "--verbose" || a == "-v") g_verbose = true;
+        else if (a == "--min-relevance" && i + 1 < argc) g_min_relevance = std::atof(argv[++i]);
         else pos.push_back(a);
     }
     std::string cfg_path = pos.size() > 0 ? pos[0] : "spokes.json";
