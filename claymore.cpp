@@ -107,9 +107,14 @@ static SAns ask_spoke(const Spoke& sp, const std::string& query) {
         r.citation = a.value("citation", ""); r.source = a.value("source", "");
         if (a.contains("confidence") && a["confidence"].is_number()) r.confidence = a["confidence"].get<double>();
         r.ok = true;
-        if (relevance(query, r.answer + " " + r.citation + " " + r.source) < g_min_relevance) {
-            if (g_verbose) fprintf(stderr, "[claymore] dropped %s response (relevance < %.2f — off-topic for the query)\n",
-                                   sp.name.c_str(), g_min_relevance);
+        // Relevance = best of (query↔response) and (query↔spoke domain). The domain term keeps a legit in-domain query
+        // phrased with synonyms the corpus doesn't use ("integer RISC operators" vs the corpus's "instructions") —
+        // while a truly off-topic query (matching neither the response nor the domain) is still dropped.
+        double rel = std::max(relevance(query, r.answer + " " + r.citation + " " + r.source),
+                              relevance(query, sp.domain));
+        if (rel < g_min_relevance) {
+            if (g_verbose) fprintf(stderr, "[claymore] dropped %s response (relevance %.2f < %.2f — off-topic)\n",
+                                   sp.name.c_str(), rel, g_min_relevance);
             r.ok = false;                               // hub relevance gate: backstop for a spoke that didn't abstain
         }
     } catch (...) { return r; }
@@ -463,15 +468,43 @@ static Result run_tools_loop(const json& client_messages) {
 }
 
 // ---- rendering: text (default) or structured json (response_format) --------------------------------------------
+// Tidy a spoke citation for display: "norm:id · Section" → "Section (id)"; otherwise return as-is.
+static std::string pretty_cite(const std::string& c) {
+    auto dot = c.find("\xC2\xB7");                                       // UTF-8 middle dot
+    if (dot == std::string::npos) return c;
+    auto trim = [](std::string s) {
+        size_t a = s.find_first_not_of(' '), b = s.find_last_not_of(' ');
+        return a == std::string::npos ? std::string() : s.substr(a, b - a + 1);
+    };
+    std::string id = trim(c.substr(0, dot)), sec = trim(c.substr(dot + 2));
+    if (id.rfind("norm:", 0) == 0) id = id.substr(5);
+    if (sec.empty()) return id;
+    return id.empty() ? sec : (sec + " (" + id + ")");
+}
+
 static std::string render_text(const Result& r) {
     if (r.mode == "abstain" || r.sources.empty()) return r.body;
     if (r.mode == "deterministic") {
         const auto& s = r.sources[0];
         return r.body + (s.second.empty() ? ("\n\n[" + s.first + "]")
-                                          : ("\n\n\xF0\x9F\x93\x96 " + s.second + "  \xC2\xB7  [" + s.first + "]"));
+                                          : ("\n\n\xF0\x9F\x93\x96 " + pretty_cite(s.second) + "  \xC2\xB7  [" + s.first + "]"));
+    }
+    // dedupe + pretty-print + collapse the noise (e.g. [logic] repeated 20x with no citation). Prefer cited entries;
+    // if none carry a citation, list the distinct spokes once.
+    std::vector<std::pair<std::string, std::string>> uniq;
+    for (const auto& s : r.sources) {
+        std::pair<std::string, std::string> p{s.first, pretty_cite(s.second)};
+        if (std::find(uniq.begin(), uniq.end(), p) == uniq.end()) uniq.push_back(p);
     }
     std::string src = "\n\nSources:";
-    for (auto& s : r.sources) src += " [" + s.first + "]" + (s.second.empty() ? "" : (" " + s.second)) + ";";
+    bool cited = false;
+    for (const auto& s : uniq)
+        if (!s.second.empty()) { src += " [" + s.first + "] " + s.second + ";"; cited = true; }
+    if (!cited) {
+        std::set<std::string> sp;
+        for (const auto& s : uniq) sp.insert(s.first);
+        for (const auto& n : sp) src += " [" + n + "];";
+    }
     return r.body + src;
 }
 
