@@ -1,3 +1,4 @@
 /build/
 *.o
 spokes.json
+compile_commands.json
