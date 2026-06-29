@@ -26,15 +26,16 @@ using json = nlohmann::json;
 
 struct Spoke { std::string name, url, domain; };
 struct SAns {
-    std::string answer, kind, citation, source, spoke, route;  // route: RETRIEVED|SELECTED|COMPOSED provenance tier
-    double confidence = -1;
-    double margin = 1e9;                           // thinnest-decision margin (1e9 = absent) — fragile-link signal
+    std::string answer, kind, citation, citation_id, source, spoke, route;  // route: RETRIEVED|SELECTED|COMPOSED tier
+    double confidence = -1;                         // citation_id = the spoke's callable handle (→ /lookup)
+    double margin = 1e9;                            // thinnest-decision margin (1e9 = absent) — fragile-link signal
     bool ok = false;
 };
+struct Src { std::string spoke, citation, id; };  // a federated citation: which spoke, the label, the callable handle (id)
 struct Result {                                   // the hub's answer + provenance
     std::string body, mode, route;                // body = answer text (no inline tag); mode = deterministic|llm|abstain
     double margin = 1e9;
-    std::vector<std::pair<std::string, std::string>> sources;  // (spoke, citation)
+    std::vector<Src> sources;                      // (spoke, citation, id) — id + spoke make the cite resolvable via /lookup
 };
 
 static std::vector<Spoke> g_spokes;
@@ -54,6 +55,15 @@ static void split_url(const std::string& url, std::string& origin, std::string& 
     if (slash == std::string::npos) { origin = url; base = ""; }
     else { origin = url.substr(0, slash); base = url.substr(slash); }
     if (!base.empty() && base.back() == '/') base.pop_back();
+}
+
+// The callable handle inside a citation: "norm:id · Section" → "norm:id" (the part before the middle dot). Used when a
+// source has no explicit citation_id (e.g. /retrieve matches carry only a section string).
+static std::string cite_id(const std::string& c) {
+    auto dot = c.find("\xC2\xB7");                                       // UTF-8 middle dot (·)
+    std::string s = (dot == std::string::npos) ? c : c.substr(0, dot);
+    size_t a = s.find_first_not_of(' '), b = s.find_last_not_of(' ');
+    return a == std::string::npos ? std::string() : s.substr(a, b - a + 1);
 }
 
 static bool is_abstain(const std::string& a, const std::string& kind) {
@@ -107,6 +117,7 @@ static SAns ask_spoke(const Spoke& sp, const std::string& query) {
         if (is_abstain(ans, kind)) return r;
         r.answer = ans; r.kind = kind; r.spoke = sp.name;
         r.citation = a.value("citation", ""); r.source = a.value("source", "");
+        r.citation_id = a.value("citation_id", "");      // the spoke's callable handle (sgiandubh emits it)
         r.route = a.value("route", "");
         if (a.contains("margin") && a["margin"].is_number()) r.margin = a["margin"].get<double>();
         if (a.contains("confidence") && a["confidence"].is_number()) r.confidence = a["confidence"].get<double>();
@@ -228,6 +239,28 @@ static std::string call_synth(const std::string& prompt) {
     try { return json::parse(res->body)["choices"][0]["message"]["content"].get<std::string>(); } catch (...) { return ""; }
 }
 
+// ---- federated handle resolution -------------------------------------------------------------------------------
+// Route a (spoke, id) to the owning spoke's /lookup → the exact source, verbatim. The hub handle is (spoke, citation_id);
+// this is what makes a federated citation *callable*: an agent reads a source's {spoke,id} and refetches it here.
+static json lookup_spoke(const Spoke& sp, const std::string& id) {
+    json out; out["spoke"] = sp.name; out["id"] = id; out["found"] = false;
+    std::string origin, base;
+    split_url(sp.url, origin, base);
+    httplib::Client cli(origin);
+    cli.set_connection_timeout(5);
+    cli.set_read_timeout(15);
+    auto res = cli.Get(base + "/lookup", httplib::Params{{"id", id}}, httplib::Headers{});
+    if (res && res->status == 200) {
+        try {
+            json j = json::parse(res->body);
+            out["found"] = j.value("found", false);
+            if (j.contains("section")) out["section"] = j["section"];
+            if (j.contains("passage")) out["passage"] = j["passage"];
+        } catch (...) {}
+    }
+    return out;
+}
+
 // ---- modes -----------------------------------------------------------------------------------------------------
 static Result deterministic(const std::vector<SAns>& ranked) {
     Result r;
@@ -236,7 +269,7 @@ static Result deterministic(const std::vector<SAns>& ranked) {
     const SAns& a = ranked[0];
     r.body = a.answer;
     r.route = a.route; r.margin = a.margin;          // carry the spoke's provenance tier + fragile-link margin
-    r.sources.push_back({a.spoke, !a.citation.empty() ? a.citation : a.source});
+    r.sources.push_back({a.spoke, !a.citation.empty() ? a.citation : a.source, a.citation_id});
     return r;
 }
 
@@ -248,7 +281,7 @@ static Result synthesize(const std::string& query, const std::vector<SAns>& rank
     for (int k = 0; k < (int)ranked.size() && k < g_top_k; k++) {
         const SAns& a = ranked[k];
         std::string cite = !a.citation.empty() ? a.citation : a.source;
-        r.sources.push_back({a.spoke, cite});
+        r.sources.push_back({a.spoke, cite, a.citation_id});
         excerpts += "[" + a.spoke + "] " + a.answer + (cite.empty() ? "" : ("  (source: " + cite + ")")) + "\n\n";
     }
     std::string prompt = "Answer the question using ONLY the expert excerpts below. Carry their sources in your "
@@ -283,6 +316,19 @@ static json list_param() {
                     {"max", json{{"type", "integer"}, {"description", "max items to return (default 20)"}}}}},
                 {"required", json::array()}};   // query optional: empty query + a section lists that whole section
 }
+static json lookup_param() {                                         // generic lookup_source: needs the spoke + id
+    return json{{"type", "object"},
+                {"properties", json{
+                    {"spoke", json{{"type", "string"}, {"description", "which expert the source came from"}}},
+                    {"id", json{{"type", "string"}, {"description", "the citation id / handle to refetch verbatim"}}}}},
+                {"required", json::array({"id"})}};
+}
+static json id_param() {                                             // per-expert lookup_<spoke>: just the id
+    return json{{"type", "object"},
+                {"properties", json{{"id", json{{"type", "string"},
+                    {"description", "the citation id / handle to refetch verbatim"}}}}},
+                {"required", json::array({"id"})}};
+}
 static json spoke_tools() {
     json tools = json::array();
     if (g_tool_style == "per-expert") {                              // one tool per spoke — the LLM picks the expert
@@ -299,6 +345,12 @@ static json spoke_tools() {
                                 " expert — for 'list/table/all/which X' questions that want MANY items, not one answer.";
             lf["parameters"] = list_param();
             tools.push_back(json{{"type", "function"}, {"function", lf}});
+            json kf;
+            kf["name"] = "lookup_" + sp.name;
+            kf["description"] = "Refetch the EXACT cited source verbatim from the " + sp.name +
+                                " expert by its citation id — to verify or quote a source returned earlier.";
+            kf["parameters"] = id_param();
+            tools.push_back(json{{"type", "function"}, {"function", kf}});
         }
     } else {                                                         // generic — claymore fan-out-routes
         std::string domains;
@@ -317,6 +369,12 @@ static json spoke_tools() {
                             "consult_experts when the user wants MANY items. Optional 'section' restricts to a facet.";
         lf["parameters"] = list_param();
         tools.push_back(json{{"type", "function"}, {"function", lf}});
+        json kf;
+        kf["name"] = "lookup_source";
+        kf["description"] = "Refetch the EXACT cited source verbatim by its citation id (and spoke) — to verify or "
+                            "quote a source returned earlier. Experts: " + domains + ".";
+        kf["parameters"] = lookup_param();
+        tools.push_back(json{{"type", "function"}, {"function", kf}});
     }
     return tools;
 }
@@ -364,6 +422,22 @@ static Result run_tools_loop(const json& client_messages) {
         json args; try { args = json::parse(argstr); } catch (...) { args = json::object(); }
         std::string q = args.value("query", "");
         std::string toolres;
+        // LOOKUP tools → resolve a citation handle to its exact source verbatim (verify/quote a cited result).
+        if (name == "lookup_source" || name.rfind("lookup_", 0) == 0) {
+            std::string id = args.value("id", "");
+            std::string sn = (name == "lookup_source") ? args.value("spoke", "") : name.substr(7);
+            for (const auto& s : g_spokes) {
+                if (!sn.empty() && s.name != sn) continue;
+                json hit = lookup_spoke(s, id);
+                if (hit.value("found", false)) {
+                    std::string sec = hit.value("section", ""), psg = hit.value("passage", "");
+                    r.sources.push_back({s.name, sec, id});
+                    if (g_verbose) fprintf(stderr, "[claymore] %s(id=\"%s\") → %s\n", name.c_str(), id.c_str(), s.name.c_str());
+                    return sec.empty() ? psg : (sec + ": \"" + psg + "\"");
+                }
+            }
+            return "(no cited source with id \"" + id + "\")";
+        }
         // LIST/aggregate tools → the spoke's /retrieve extension, returning a SET of cited passages (not one answer)
         if (name == "list_matching" || name.rfind("list_", 0) == 0) {
             std::string section = args.value("section", "");
@@ -381,7 +455,7 @@ static Result run_tools_loop(const json& client_messages) {
             if (ms.empty()) return "(no matching passages)";
             for (const auto& m : ms) {
                 toolres += "- " + m.passage + (m.section.empty() ? "" : ("  (source: " + m.section + ")")) + "\n";
-                r.sources.push_back({m.spoke, m.section});
+                r.sources.push_back({m.spoke, m.section, cite_id(m.section)});
             }
             return toolres;
         }
@@ -393,7 +467,7 @@ static Result run_tools_loop(const json& client_messages) {
                 const SAns& a = ranked[k];
                 std::string cite = !a.citation.empty() ? a.citation : a.source;
                 toolres += "[" + a.spoke + "] " + a.answer + (cite.empty() ? "" : ("  (source: " + cite + ")")) + "\n";
-                r.sources.push_back({a.spoke, cite});
+                r.sources.push_back({a.spoke, cite, a.citation_id});
             }
         } else {                                                          // per-expert: ask_<spoke>
             std::string sn = (name.rfind("ask_", 0) == 0) ? name.substr(4) : name;
@@ -405,7 +479,7 @@ static Result run_tools_loop(const json& client_messages) {
                 if (a.ok) {
                     std::string cite = !a.citation.empty() ? a.citation : a.source;
                     toolres = a.answer + (cite.empty() ? "" : ("  (source: " + cite + ")"));
-                    r.sources.push_back({sp->name, cite});
+                    r.sources.push_back({sp->name, cite, a.citation_id});
                 } else {
                     toolres = "(the " + sn + " expert has nothing on that — abstained)";
                 }
@@ -491,8 +565,8 @@ static std::string render_text(const Result& r) {
     if (r.mode == "abstain" || r.sources.empty()) return r.body;
     if (r.mode == "deterministic") {
         const auto& s = r.sources[0];
-        std::string out = r.body + (s.second.empty() ? ("\n\n[" + s.first + "]")
-                                          : ("\n\n\xF0\x9F\x93\x96 " + pretty_cite(s.second) + "  \xC2\xB7  [" + s.first + "]"));
+        std::string out = r.body + (s.citation.empty() ? ("\n\n[" + s.spoke + "]")
+                                          : ("\n\n\xF0\x9F\x93\x96 " + pretty_cite(s.citation) + "  \xC2\xB7  [" + s.spoke + "]"));
         if (!r.route.empty() || r.margin < 1e8) {     // carry the spoke's provenance tier (recall vs forge-tax)
             char mb[64];
             if (!r.route.empty() && r.margin < 1e8) snprintf(mb, sizeof mb, "%s · margin %+.2f", r.route.c_str(), r.margin);
@@ -506,7 +580,7 @@ static std::string render_text(const Result& r) {
     // if none carry a citation, list the distinct spokes once.
     std::vector<std::pair<std::string, std::string>> uniq;
     for (const auto& s : r.sources) {
-        std::pair<std::string, std::string> p{s.first, pretty_cite(s.second)};
+        std::pair<std::string, std::string> p{s.spoke, pretty_cite(s.citation)};
         if (std::find(uniq.begin(), uniq.end(), p) == uniq.end()) uniq.push_back(p);
     }
     std::string src = "\n\nSources:";
@@ -526,7 +600,12 @@ static std::string render_json(const Result& r) {
     j["answer"] = r.body;
     j["mode"] = r.mode;
     json srcs = json::array();
-    for (auto& s : r.sources) { json o; o["spoke"] = s.first; if (!s.second.empty()) o["citation"] = s.second; srcs.push_back(o); }
+    for (auto& s : r.sources) {                                       // each source carries its callable handle (spoke,id)
+        json o; o["spoke"] = s.spoke;
+        if (!s.citation.empty()) o["citation"] = s.citation;
+        if (!s.id.empty()) o["id"] = s.id;                            // GET /lookup?spoke=<spoke>&id=<id> refetches it
+        srcs.push_back(o);
+    }
     j["sources"] = srcs;
     if (!r.route.empty()) j["route"] = r.route;       // provenance tier (RETRIEVED|SELECTED|COMPOSED)
     if (r.margin < 1e8) j["margin"] = r.margin;       // thinnest-decision margin (fragile-link signal)
@@ -738,6 +817,27 @@ int main(int argc, char** argv) {
     };
     svr.Get("/health", health_handler);
     svr.Get("/healthz", health_handler);
+    // Federated citation-as-handle: refetch the exact source a federated citation points to. GET /lookup?spoke=&id=
+    // (spoke optional → tries all). Routes to the owning spoke's /lookup; bounded — unknown spoke/id → not found.
+    auto lookup_handler = [](const httplib::Request& q, httplib::Response& res) {
+        std::string id = q.has_param("id") ? q.get_param_value("id") : "";
+        std::string spoke = q.has_param("spoke") ? q.get_param_value("spoke") : "";
+        if (id.empty() && !q.body.empty()) {
+            try { json b = json::parse(q.body); id = b.value("id", ""); spoke = b.value("spoke", spoke); } catch (...) {}
+        }
+        json out;
+        bool found = false;
+        for (const auto& sp : g_spokes) {
+            if (!spoke.empty() && sp.name != spoke) continue;
+            out = lookup_spoke(sp, id);
+            if (out.value("found", false)) { found = true; break; }
+        }
+        if (!found && out.is_null()) { out = json::object(); out["id"] = id; out["found"] = false; }
+        res.status = found ? 200 : 404;
+        res.set_content(out.dump(), "application/json");
+    };
+    svr.Get("/lookup", lookup_handler);
+    svr.Post("/lookup", lookup_handler);
     svr.Post("/v1/chat/completions", [](const httplib::Request& q, httplib::Response& r) { handle(q, r, "chat"); });
     svr.Post("/v1/completions", [](const httplib::Request& q, httplib::Response& r) { handle(q, r, "text"); });
     svr.Post("/v1/messages", [](const httplib::Request& q, httplib::Response& r) { handle(q, r, "anthropic"); });
