@@ -63,7 +63,32 @@ Point any OpenAI client at `http://localhost:9000/v1` (or `http://localhost:9000
 `llm` synthesis mode (local llama.cpp or a remote API), see *The hub LLM* below.
 
 **CLI / manual testing:** `./build/claymore spokes.json --repl` — read queries from stdin and print answers, no
-server. Honors the configured mode (deterministic / llm / tools). Handy for quick checks against the hub.
+server. Honors the configured mode (deterministic / llm / tools). Handy for quick checks against the hub. The REPL
+also exposes the other two layers of the stack: `/catalog` (the librarian — what experts exist), `/tutors` (teaching
+templates from a `role:"pedagogy"` spoke), `/experts` (the content experts), and `/session <tutor> [on <expert>…]` to
+enter a bounded **mentoring session** (multi-turn; the tutor is scoped to the chosen experts = the syllabus boundary);
+`/end` leaves it. `/help` lists them.
+
+**Full-stack demo:** `examples/run-local.sh` brings up a no-external-APIs stack on one box — a tool-capable coding
+model (llama.cpp) + content experts (riscv, logic) + a **librarian** (`role:"librarian"`, a model-free catalog over
+the content experts) + **tutors** (`role:"pedagogy"`, model-free prompt templates). Run it with `--cli` for the REPL
+(try `/catalog`, `/tutors`, `/session socratic-tutor on riscv`) or bare for the OpenAI server on :9000. The librarian
+and tutors are built by [rosetta](https://github.com/jascal/rosetta) (a sibling checkout); without it the script still
+runs the content layer and notes the others are disabled.
+
+A quick REPL tour (`./examples/run-local.sh --cli`):
+
+```
+/catalog                          # the librarian — every expert/collection this hub fronts
+/experts                          # the content experts you can study
+/tutors                           # the teaching templates (model-free prompt experts)
+/session socratic-tutor on riscv  # enter a bounded tutoring session; ask away; /end to leave
+what does the LR/SC pair guarantee?
+/end
+how many RISC-V instructions are there?   # back to plain Q&A (fans out to the experts)
+```
+
+Tear the whole stack down with `pkill -f 'llama-server|build/sgiandubh|build/claymore'`.
 
 ## Why the abstain-router works
 Every sgiandubh spoke answers only its own material and abstains otherwise, so claymore doesn't need a trained
