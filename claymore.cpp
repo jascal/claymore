@@ -11,6 +11,7 @@
 #include "httplib.h"
 #include "json.hpp"
 #include "md_render.h"
+#include "repl_tui.h"
 #include <algorithm>
 #include <atomic>
 #include <cctype>
@@ -1128,10 +1129,11 @@ static void handle(const httplib::Request& req, httplib::Response& res, const st
 
 int main(int argc, char** argv) {
     std::vector<std::string> pos;
-    bool repl = false;
+    bool repl = false, plain = false;
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         if (a == "--repl") repl = true;
+        else if (a == "--plain") plain = true;                    // REPL: disable the fixed-input/footer TUI (plain getline)
         else if (a == "--verbose" || a == "-v") g_verbose = true;
         else if (a == "--min-relevance" && i + 1 < argc) g_min_relevance = std::atof(argv[++i]);
         else pos.push_back(a);
@@ -1182,6 +1184,8 @@ int main(int argc, char** argv) {
     if (repl) {  // CLI: content Q&A by default; enter a MENTORING SESSION with /session (no server)
         bool have_llm = !g_synth.value("url", "").empty();
         g_tty = isatty(fileno(stdout));                           // render markdown/TeX only for an interactive terminal
+        repltui::Repl ui;                                         // fixed input line + status footer (TTY only; --plain opts out)
+        if (!plain) ui.start("CLAYMORE_REPL_PLAIN");
         fprintf(stderr, "claymore REPL — content Q&A by default.\n"
                         "  /catalog                      list the federated catalog (the librarian — what exists)\n"
                         "  /tutors                       list teaching templates (the pedagogy expert)\n"
@@ -1196,11 +1200,21 @@ int main(int argc, char** argv) {
         std::vector<std::string> last_suggestions;                // the tutor's most-recent suggestions (pick with "#N")
         std::string line;
         while (true) {
-            std::string prompt = session.ok ? ("\n[" + session_name + "]> ") : "\n> ";
-            fprintf(stderr, "%s", prompt.c_str());
-            fflush(stderr);
-            if (!std::getline(std::cin, line)) break;
-            if (line.empty()) break;                              // blank line / Ctrl-D → quit the REPL
+            std::string foot;                                     // status footer: session state, else hub state
+            if (session.ok) {
+                foot = "[" + session_name + "]";
+                std::string sc; for (const auto& n : session.scope) sc += (sc.empty() ? "" : ",") + n;
+                if (!sc.empty()) foot += " on " + sc;
+                if (!session.key.empty()) foot += " · key=" + session.key;
+                foot += " · #N pick · /end · blank=quit";
+            } else {
+                foot = "claymore · mode=" + g_mode + " · " + std::to_string(g_spokes.size()) +
+                       " spoke(s) · /help · blank=quit";
+            }
+            ui.set_footer(foot);
+            std::string prompt = session.ok ? ("[" + session_name + "]> ") : "> ";
+            if (ui.readline(prompt, line) == repltui::Repl::EOF_QUIT) break;
+            if (line.empty()) break;                              // blank line → quit the REPL
 
             if (line[0] == '/') {                                 // ---- a REPL command ----
                 std::istringstream ss(line.substr(1));
@@ -1333,6 +1347,7 @@ int main(int argc, char** argv) {
             fflush(stdout);
             if (session.ok) { last_suggestions = gen_suggestions(history, session); print_suggestions(last_suggestions); }
         }
+        ui.stop();
         return 0;
     }
 

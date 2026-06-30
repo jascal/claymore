@@ -67,7 +67,9 @@ server. Honors the configured mode (deterministic / llm / tools). Handy for quic
 also exposes the other two layers of the stack: `/catalog` (the librarian — what experts exist), `/tutors` (teaching
 templates from a `role:"pedagogy"` spoke), `/experts` (the content experts), and `/session <tutor> [on <expert>…]` to
 enter a bounded **mentoring session** (multi-turn; the tutor is scoped to the chosen experts = the syllabus boundary);
-`/end` leaves it. `/help` lists them.
+`/end` leaves it. `/help` lists them. On an interactive terminal the REPL anchors a **fixed input line + a status
+footer** at the bottom while answers scroll above (markdown/TeX rendered); pass `--plain` (or set `CLAYMORE_REPL_PLAIN`)
+to fall back to a plain line-by-line prompt, which is also what you get when stdin/stdout is piped.
 
 **Full-stack demo:** `examples/run-local.sh` brings up a no-external-APIs stack on one box — a tool-capable coding
 model (llama.cpp) + content experts (riscv, logic) + a **librarian** (`role:"librarian"`, a model-free catalog over
