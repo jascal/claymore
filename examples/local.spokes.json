@@ -1,7 +1,11 @@
 {
   "spokes": [
     {"name": "riscv", "url": "http://localhost:8081", "domain": "RISC-V ISA specification"},
-    {"name": "logic", "url": "http://localhost:8082", "domain": "formal logic"}
+    {"name": "logic", "url": "http://localhost:8082", "domain": "formal logic"},
+    {"name": "library", "role": "librarian", "url": "http://localhost:8200",
+     "domain": "catalog of the bounded experts this hub fronts (the librarian)"},
+    {"name": "tutors", "role": "pedagogy", "url": "http://localhost:8300",
+     "domain": "teaching/mentoring templates (model-free prompt experts)"}
   ],
   "mode": "tools",
   "tool_style": "generic",

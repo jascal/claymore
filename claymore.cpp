@@ -1046,6 +1046,7 @@ int main(int argc, char** argv) {
     if (repl) {  // CLI: content Q&A by default; enter a MENTORING SESSION with /session (no server)
         bool have_llm = !g_synth.value("url", "").empty();
         fprintf(stderr, "claymore REPL — content Q&A by default.\n"
+                        "  /catalog                      list the federated catalog (the librarian — what exists)\n"
                         "  /tutors                       list teaching templates (the pedagogy expert)\n"
                         "  /experts                      list content experts (what you can study)\n"
                         "  /session <tutor> [on <e>…]    start a mentoring session (e.g. /session socratic-tutor on riscv)\n"
@@ -1065,10 +1066,19 @@ int main(int argc, char** argv) {
                 std::istringstream ss(line.substr(1));
                 std::string cmd; ss >> cmd;
                 if (cmd == "help") {
-                    fprintf(stderr, "  /tutors  /experts  /session <tutor> [on <expert>…]  /end  (blank = quit)\n");
+                    fprintf(stderr, "  /catalog  /tutors  /experts  /session <tutor> [on <expert>…]  /end  (blank = quit)\n");
+                } else if (cmd == "catalog") {            // the librarian, demonstrable without an LLM (like /tutors)
+                    json cards = federate_catalog();
+                    if (cards.empty()) fprintf(stderr, "  (empty catalog — no experts reachable)\n");
+                    for (const auto& c : cards) {
+                        std::string h = c.value("handle", c.value("title", c.value("id", std::string("?"))));
+                        std::string s = c.value("summary", c.value("domain", std::string()));
+                        if (s.size() > 90) s = s.substr(0, 90);
+                        fprintf(stderr, "  %-26s %s\n", h.c_str(), s.c_str());
+                    }
                 } else if (cmd == "experts") {
                     for (const auto& sp : g_spokes)
-                        if (sp.role != "pedagogy")
+                        if (sp.role.empty())             // content experts only (no librarian/pedagogy meta-roles)
                             fprintf(stderr, "  %-14s %s\n", sp.name.c_str(), sp.domain.c_str());
                 } else if (cmd == "tutors") {
                     const Spoke* ped = nullptr;
