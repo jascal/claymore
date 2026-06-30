@@ -170,10 +170,9 @@ static double score(const SAns& a) {
 
 static std::vector<SAns> fan_out(const std::string& query) {
     std::vector<std::future<SAns>> futs;
-    for (const auto& sp : g_spokes) {
-        if (sp.role == "librarian") continue;            // the catalog is meta — not a content expert to fan out to
-        futs.push_back(std::async(std::launch::async, ask_spoke, std::cref(sp), std::cref(query)));
-    }
+    for (const auto& sp : g_spokes)                       // every spoke participates — a catalog expert answers catalog
+        futs.push_back(std::async(std::launch::async, ask_spoke, std::cref(sp), std::cref(query)));  // queries, the
+    // relevance gate drops its cards from unrelated answers. (No exclusion — librarians must federate, not be hidden.)
     std::vector<SAns> res;
     for (auto& f : futs) { SAns a = f.get(); if (a.ok) res.push_back(a); }
     std::sort(res.begin(), res.end(), [](const SAns& x, const SAns& y) { return score(x) > score(y); });
@@ -206,11 +205,9 @@ static std::vector<Match> retrieve_spoke(const Spoke& sp, const std::string& que
 
 static std::vector<Match> retrieve_all(const std::string& query, const std::string& section, int max) {
     std::vector<std::future<std::vector<Match>>> futs;
-    for (const auto& sp : g_spokes) {
-        if (sp.role == "librarian") continue;            // content retrieval only; the catalog is reached via find/catalog
+    for (const auto& sp : g_spokes)                       // all spokes — a catalog expert returns its document cards
         futs.push_back(std::async(std::launch::async, retrieve_spoke, std::cref(sp),
                                   std::cref(query), std::cref(section), max));
-    }
     std::vector<Match> all;
     for (auto& f : futs) { auto v = f.get(); all.insert(all.end(), v.begin(), v.end()); }
     std::sort(all.begin(), all.end(), [](const Match& a, const Match& b) { return a.score > b.score; });
@@ -324,6 +321,36 @@ static json lookup_spoke(const Spoke& sp, const std::string& id) {
         } catch (...) { return false; }
     });
     return out;
+}
+
+// ---- federated librarian: aggregate every spoke's /catalog ------------------------------------------------------
+// Each spoke contributes cards via its /catalog: a leaf sgiandubh its degenerate self-card (or a catalog package's
+// document cards); a CHILD CLAYMORE its own federated catalog (recursion). So the catalog rolls up the hierarchy —
+// no node is excluded. With replicas/failover, like every other federated call.
+static json catalog_spoke(const Spoke& sp) {
+    json cards = json::array();
+    call_replica(sp, [&](const std::string& origin, const std::string& base) -> bool {
+        httplib::Client cli(origin);
+        cli.set_connection_timeout(5);
+        cli.set_read_timeout(15);
+        auto res = cli.Get(base + "/catalog");
+        if (!res || res->status != 200) return false;             // spoke lacks /catalog (older build) → fail over / skip
+        try {
+            for (auto& c : json::parse(res->body).value("cards", json::array())) {
+                json cc = c;
+                cc["spoke"] = sp.name;                             // tag provenance: which spoke this card came from
+                cards.push_back(cc);
+            }
+            return true;
+        } catch (...) { return false; }
+    });
+    return cards;
+}
+static json federate_catalog() {
+    json all = json::array();
+    for (const auto& sp : g_spokes)
+        for (auto& c : catalog_spoke(sp)) all.push_back(c);
+    return all;
 }
 
 // ---- modes -----------------------------------------------------------------------------------------------------
@@ -441,24 +468,21 @@ static json spoke_tools() {
         kf["parameters"] = lookup_param();
         tools.push_back(json{{"type", "function"}, {"function", kf}});
     }
-    // LIBRARIAN tools — present the catalog expert(s) to the LLM (like retrieve/lookup), at both document and expert
-    // granularity. find_document returns cards whose handle (lib:<expert>:<doc>) points INTO a content expert.
-    std::string libs;
-    for (const auto& sp : g_spokes) if (sp.role == "librarian") libs += (libs.empty() ? "" : ", ") + sp.name;
-    if (!libs.empty()) {
-        json ff;
-        ff["name"] = "find_document";
-        ff["description"] = "Find which DOCUMENT(s)/expert(s) cover a topic, via the catalog (librarian: " + libs +
-                            "). Returns catalog cards; each card's handle (lib:<expert>:<doc>) names the content "
-                            "expert + document — then ask/list/lookup that expert for the actual content.";
-        ff["parameters"] = query_param();
-        tools.push_back(json{{"type", "function"}, {"function", ff}});
+    // LIBRARIAN tools — the catalog is UNIVERSAL (every spoke exposes /catalog; this hub federates them), so these are
+    // always offered. catalog() = the directory of experts/collections; find_document() = search across them.
+    if (!g_spokes.empty()) {
         json cf;
         cf["name"] = "catalog";
-        cf["description"] = "Browse the document catalog. Empty query lists the collection; a query returns matching "
-                            "document cards. Use to discover WHAT exists before consulting a content expert.";
+        cf["description"] = "List the federated catalog — every expert/collection this hub fronts (each card names a "
+                            "content expert + what it covers). Use to discover WHAT exists before consulting an expert.";
         cf["parameters"] = list_param();
         tools.push_back(json{{"type", "function"}, {"function", cf}});
+        json ff;
+        ff["name"] = "find_document";
+        ff["description"] = "Search the catalogs for documents/passages on a topic, across all experts. Returns cited "
+                            "cards/passages whose handle points INTO a content expert — then ask/lookup that expert.";
+        ff["parameters"] = query_param();
+        tools.push_back(json{{"type", "function"}, {"function", ff}});
     }
     return tools;
 }
@@ -554,20 +578,28 @@ static Result run_tools_loop(const json& client_messages) {
             }
             return toolres;
         }
-        // LIBRARIAN tools → query the catalog expert(s); return cards whose handle points INTO a content expert.
-        if (name == "find_document" || name == "catalog") {
+        // CATALOG tool → the federated directory: every expert/collection this hub (recursively) fronts.
+        if (name == "catalog") {
+            json cards = federate_catalog();
+            if (g_verbose) fprintf(stderr, "[claymore] catalog → %zu card(s)\n", cards.size());
+            if (cards.empty()) return "(empty catalog)";
+            for (auto& c : cards) {
+                std::string label = c.contains("title") ? c.value("title", "") : c.value("summary", "");
+                std::string h = c.value("handle", "");
+                toolres += "- [" + c.value("spoke", "") + "] " + label + (h.empty() ? "" : ("  (handle: " + h + ")")) + "\n";
+            }
+            return toolres;
+        }
+        // FIND_DOCUMENT → search content + catalog spokes for matching passages/cards (handles point INTO experts).
+        if (name == "find_document") {
             std::string section = args.value("section", "");
-            int mx = args.value("max", name == "catalog" ? 20 : 5);
-            std::vector<Match> ms;
-            for (const auto& s : g_spokes)
-                if (s.role == "librarian") {
-                    auto v = retrieve_spoke(s, q, section, mx);
-                    ms.insert(ms.end(), v.begin(), v.end());
-                }
-            if (g_verbose) fprintf(stderr, "[claymore] %s(query=\"%s\") → %zu card(s)\n", name.c_str(), q.c_str(), ms.size());
-            if (ms.empty()) return "(no catalog entries match)";
+            int mx = args.value("max", 8);
+            auto ms = retrieve_all(q, section, mx);
+            if (g_verbose) fprintf(stderr, "[claymore] find_document(query=\"%s\") → %zu hit(s)\n", q.c_str(), ms.size());
+            if (ms.empty()) return "(nothing in the catalogs matches)";
             for (const auto& m : ms) {
-                toolres += "- " + m.passage + (m.section.empty() ? "" : ("  (handle: " + cite_id(m.section) + ")")) + "\n";
+                toolres += "- " + m.passage +
+                           (m.section.empty() ? "" : ("  (handle: " + cite_id(m.section) + ", spoke: " + m.spoke + ")")) + "\n";
                 r.sources.push_back({m.spoke, m.section, cite_id(m.section)});
             }
             return toolres;
@@ -985,6 +1017,12 @@ int main(int argc, char** argv) {
             matches.push_back(json{{"section", m.section}, {"passage", m.passage}, {"score", m.score}});
         json out; out["object"] = "retrieve"; out["matches"] = matches;
         res.set_content(out.dump(), "application/json");
+    });
+    // Federated /catalog — aggregate every spoke's /catalog (a child claymore contributes its own federated catalog →
+    // the catalog rolls up the hierarchy). The universal librarian; degenerate self-cards from leaf sgiandubhs included.
+    svr.Get("/catalog", [](const httplib::Request&, httplib::Response& res) {
+        json out; out["object"] = "catalog"; out["cards"] = federate_catalog();
+        res.set_content(out.dump(-1, ' ', false, json::error_handler_t::replace), "application/json");
     });
     svr.Post("/v1/chat/completions", [](const httplib::Request& q, httplib::Response& r) { handle(q, r, "chat"); });
     svr.Post("/v1/completions", [](const httplib::Request& q, httplib::Response& r) { handle(q, r, "text"); });
