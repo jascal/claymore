@@ -788,6 +788,10 @@ int main(int argc, char** argv) {
             if (s.contains(key) && s[key].is_array())
                 for (auto& u : s[key]) sp.urls.push_back(u.get<std::string>());
         if (s.contains("url") && s["url"].is_string()) sp.urls.push_back(s["url"].get<std::string>());
+        std::vector<std::string> uniq;                           // dedupe (a replica listed twice, or url ∈ urls) —
+        std::set<std::string> seen;                              // order-preserving, so round-robin isn't skewed
+        for (auto& u : sp.urls) if (!u.empty() && seen.insert(u).second) uniq.push_back(u);
+        sp.urls = std::move(uniq);
         if (!sp.urls.empty()) g_spokes.push_back(std::move(sp));
     }
     g_mode = cfg.value("mode", "deterministic");
