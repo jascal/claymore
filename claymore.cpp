@@ -954,7 +954,9 @@ static Session assemble_session(const json& sess) {
 
     std::string tmpl = sess.value("template_text", "");           // caller-inline template wins; else the library
     if (tmpl.empty()) tmpl = fetch_template(sess.value("template", "tutor"));
-    if (tmpl.empty()) return s;                                   // no template resolved → ok stays false
+    if (tmpl.empty())                                            // no pedagogy expert / no match → graceful built-in
+        tmpl = "You are a bounded tutor for {scope}. Teach toward {objectives} using ONLY the expert tools; ask guiding "
+               "questions one at a time and cite each fact. {content}";
 
     json vars = sess.value("variables", json::object());
     vars["scope"] = scope_desc;
