@@ -133,6 +133,11 @@ bounded *spokes* (sgiandubh) have no tools — they answer; tool-calling lives o
 are read from the named env var (local llama.cpp needs none). `top_k` bounds how many spoke answers feed the
 synthesizer. If the backend is unreachable, claymore falls back to the deterministic cited answer.
 
+**Pointing at a separate / remote LLM, `mode:"tools"` vs `mode:"llm"`, redundant `backends`, and when an LLM proxy
+(Azure, Anthropic-with-tools, gateways) is or isn't needed — and how the expert tools get registered through one — are
+covered in [`docs/llm-backends.md`](docs/llm-backends.md).** Short version: claymore is the agent, the tools ride in
+the request body, so switching endpoints is just config — a proxy is rarely required and is transparent to the tools.
+
 ## Guarantee boundary
 Keep the hard promises in claymore (the deterministic gate: all-abstain → refuse; citations carried from spokes), and
 let the optional hub LLM handle only phrasing/synthesis. A jailbreak of the hub LLM degrades *style*, not *safety* —
