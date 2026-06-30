@@ -1081,11 +1081,15 @@ int main(int argc, char** argv) {
                         if (sp.role.empty())             // content experts only (no librarian/pedagogy meta-roles)
                             fprintf(stderr, "  %-14s %s\n", sp.name.c_str(), sp.domain.c_str());
                 } else if (cmd == "tutors") {
-                    const Spoke* ped = nullptr;
-                    for (const auto& sp : g_spokes) if (sp.role == "pedagogy") ped = &sp;
-                    if (!ped) { fprintf(stderr, "  (no pedagogy expert configured — a role:\"pedagogy\" spoke)\n"); }
-                    else for (const auto& m : retrieve_spoke(*ped, "", "", 20))
-                        fprintf(stderr, "  %s\n", m.section.c_str());
+                    bool any = false; std::set<std::string> seen;
+                    for (const auto& sp : g_spokes) {              // aggregate across ALL pedagogy providers (federation)
+                        if (sp.role != "pedagogy") continue;
+                        any = true;
+                        for (const auto& m : retrieve_spoke(sp, "", "", 0))   // k=0 → every template (no 20-cap)
+                            if (seen.insert(m.section).second)               // dedupe templates offered by >1 provider
+                                fprintf(stderr, "  %s\n", m.section.c_str());
+                    }
+                    if (!any) fprintf(stderr, "  (no pedagogy expert configured — a role:\"pedagogy\" spoke)\n");
                 } else if (cmd == "session") {
                     std::string tok, tmpl, on; std::vector<std::string> scope;
                     while (ss >> tok) {                           // "<tutor words…> [on <expert>…]"
@@ -1107,14 +1111,17 @@ int main(int argc, char** argv) {
                     }
                     if (!scope.empty() && bad.size() == scope.size()) {
                         fprintf(stderr, "  no valid experts in scope — the tutor would have no tools; not starting\n"); continue; }
-                    // validate the tutor name — warn (don't abort) if it'll fall back to the built-in generic tutor
-                    const Spoke* pedx = nullptr;
-                    for (const auto& sp : g_spokes) if (sp.role == "pedagogy") pedx = &sp;
-                    if (pedx && !tmpl.empty()) {
-                        bool hit = false;
-                        for (const auto& m : retrieve_spoke(*pedx, "", "", 50))
-                            if (low(m.section).find(low(tmpl)) != std::string::npos) { hit = true; break; }
-                        if (!hit) fprintf(stderr, "  note: no tutor matches '%s' — using the built-in generic tutor (see /tutors)\n", tmpl.c_str());
+                    // validate the tutor name across ALL pedagogy providers — warn (don't abort) if it'll fall back
+                    if (!tmpl.empty()) {
+                        bool hit = false, anyped = false;
+                        for (const auto& sp : g_spokes) {
+                            if (sp.role != "pedagogy") continue;
+                            anyped = true;
+                            for (const auto& m : retrieve_spoke(sp, "", "", 0))
+                                if (low(m.section).find(low(tmpl)) != std::string::npos) { hit = true; break; }
+                            if (hit) break;
+                        }
+                        if (anyped && !hit) fprintf(stderr, "  note: no tutor matches '%s' — using the built-in generic tutor (see /tutors)\n", tmpl.c_str());
                     }
                     json sess; sess["template"] = tmpl.empty() ? "tutor" : tmpl;
                     if (!scope.empty()) sess["scope"] = scope;
