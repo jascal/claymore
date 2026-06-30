@@ -11,6 +11,12 @@
       "domain": "formal logic"
     },
     {
+      "name": "riscv-vector",
+      "url": "http://localhost:8081",
+      "key": "V Extension",
+      "domain": "RISC-V vector (V) extension — a SUBSET of the riscv expert, restricted by key"
+    },
+    {
       "name": "anatomy",
       "url": "http://localhost:8083",
       "domain": "human anatomy & physiology"

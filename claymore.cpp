@@ -10,6 +10,7 @@
 // Anthropic /v1/messages, SSE streaming, and response_format json_object — so clients see one drop-in endpoint.
 #include "httplib.h"
 #include "json.hpp"
+#include "md_render.h"
 #include <algorithm>
 #include <atomic>
 #include <cctype>
@@ -23,13 +24,18 @@
 #include <set>
 #include <sstream>
 #include <string>
+#include <unistd.h>
 #include <vector>
 using json = nlohmann::json;
+
+static bool g_tty = false;   // stdout is an interactive terminal → render markdown/TeX in the REPL (set in main)
 
 // A spoke can front N REDUNDANT replicas of the same expert (identical sgiandubh copies — or another claymore, since
 // they share an API) for reliability (failover) + scale (load spread). One `url` → one replica; `urls`/`replicas` → many.
 // role: "" = a content expert (fanned out + ask/list/lookup); "librarian" = a catalog expert backing find/catalog tools.
-struct Spoke { std::string name, domain, role; std::vector<std::string> urls; };
+struct Spoke { std::string name, domain, role, key; std::vector<std::string> urls; };
+// `key` (optional): a SUBSET key forwarded to the spoke so this entry only sees a slice of a larger expert. Two spoke
+// entries can share a url but differ in key → one big sgiandubh fronted as several bounded subset-experts.
 struct SAns {
     std::string answer, kind, citation, citation_id, source, spoke, route;  // route: RETRIEVED|SELECTED|COMPOSED tier
     double confidence = -1;                         // citation_id = the spoke's callable handle (→ /lookup)
@@ -41,6 +47,7 @@ struct Result {                                   // the hub's answer + provenan
     std::string body, mode, route;                // body = answer text (no inline tag); mode = deterministic|llm|abstain
     double margin = 1e9;
     std::vector<Src> sources;                      // (spoke, citation, id) — id + spoke make the cite resolvable via /lookup
+    std::vector<std::string> suggestions;          // tutor sessions: suggested next prompts for the learner (may be empty)
 };
 
 static std::vector<Spoke> g_spokes;
@@ -118,10 +125,19 @@ static double relevance(const std::string& query, const std::string& response) {
     for (const auto& x : q) if (r.count(x)) inter++;
     return (double)inter / (double)(q.size() + r.size() - inter);   // Jaccard
 }
+static std::string trim(const std::string& s) {
+    size_t a = s.find_first_not_of(" \t\r\n"), b = s.find_last_not_of(" \t\r\n");
+    return a == std::string::npos ? std::string() : s.substr(a, b - a + 1);
+}
+// Sentinel separating a pedagogy template's system scaffold from its JSON tutor-metadata tail (opener + scope
+// restriction), emitted by rosetta's pedagogy adapter. The subject↔domain match below this floor doesn't bind a tutor.
+static const std::string TUTOR_META = "[[TUTOR_META]]";
+static const double TUTOR_SUBJECT_MIN = 0.05;
 
 // ---- spokes ----------------------------------------------------------------------------------------------------
-static SAns ask_spoke(const Spoke& sp, const std::string& query) {
+static SAns ask_spoke(const Spoke& sp, const std::string& query, const std::string& key = "") {
     SAns r;
+    const std::string ek = key.empty() ? sp.key : key;            // session/tool key overrides the spoke's configured key
     call_replica(sp, [&](const std::string& origin, const std::string& base) -> bool {
     httplib::Client cli(origin);
     cli.set_connection_timeout(5);
@@ -129,6 +145,7 @@ static SAns ask_spoke(const Spoke& sp, const std::string& query) {
     json req;
     req["messages"] = json::array({json{{"role", "user"}, {"content", query}}});
     req["response_format"] = json{{"type", "json_object"}};
+    if (!ek.empty()) req["key"] = ek;                             // confine this call to a content slice of the expert
     auto res = cli.Post(base + "/v1/chat/completions", req.dump(), "application/json");
     if (!res || res->status != 200) return false;             // replica down/erroring → fail over to the next
     try {
@@ -169,10 +186,10 @@ static double score(const SAns& a) {
     return 0.5;
 }
 
-static std::vector<SAns> fan_out(const std::string& query) {
+static std::vector<SAns> fan_out(const std::string& query, const std::string& key = "") {
     std::vector<std::future<SAns>> futs;
     for (const auto& sp : g_spokes)                       // every spoke participates — a catalog expert answers catalog
-        futs.push_back(std::async(std::launch::async, ask_spoke, std::cref(sp), std::cref(query)));  // queries, the
+        futs.push_back(std::async(std::launch::async, ask_spoke, std::cref(sp), std::cref(query), key));  // queries, the
     // relevance gate drops its cards from unrelated answers. (No exclusion — librarians must federate, not be hidden.)
     std::vector<SAns> res;
     for (auto& f : futs) { SAns a = f.get(); if (a.ok) res.push_back(a); }
@@ -186,13 +203,15 @@ static std::vector<SAns> fan_out(const std::string& query) {
 struct Match { std::string spoke, section, passage; double score = 0; };
 
 static std::vector<Match> retrieve_spoke(const Spoke& sp, const std::string& query,
-                                         const std::string& section, int max) {
+                                         const std::string& section, int max, const std::string& key = "") {
     std::vector<Match> out;
+    const std::string ek = key.empty() ? sp.key : key;            // session/tool key overrides the spoke's configured key
     call_replica(sp, [&](const std::string& origin, const std::string& base) -> bool {
         httplib::Client cli(origin);
         cli.set_connection_timeout(5);
         cli.set_read_timeout(15);
         json req{{"query", query}, {"section", section}, {"k", max}};
+        if (!ek.empty()) req["key"] = ek;                         // confine retrieval to a content slice of the expert
         auto res = cli.Post(base + "/retrieve", req.dump(), "application/json");
         if (!res || res->status != 200) return false;   // replica down / lacks /retrieve → fail over to the next
         try {
@@ -204,11 +223,12 @@ static std::vector<Match> retrieve_spoke(const Spoke& sp, const std::string& que
     return out;
 }
 
-static std::vector<Match> retrieve_all(const std::string& query, const std::string& section, int max) {
+static std::vector<Match> retrieve_all(const std::string& query, const std::string& section, int max,
+                                       const std::string& key = "") {
     std::vector<std::future<std::vector<Match>>> futs;
     for (const auto& sp : g_spokes)                       // all spokes — a catalog expert returns its document cards
         futs.push_back(std::async(std::launch::async, retrieve_spoke, std::cref(sp),
-                                  std::cref(query), std::cref(section), max));
+                                  std::cref(query), std::cref(section), max, key));
     std::vector<Match> all;
     for (auto& f : futs) { auto v = f.get(); all.insert(all.end(), v.begin(), v.end()); }
     std::sort(all.begin(), all.end(), [](const Match& a, const Match& b) { return a.score > b.score; });
@@ -551,9 +571,10 @@ static const char* TOOLS_STEER =
     "say the topic isn't covered. Never answer from your own prior knowledge.";
 
 // `system_override` replaces the default steer (a teaching SESSION's assembled pedagogy prompt); `scope` restricts the
-// offered tools to the in-bounds content experts. Empty → the normal open tools loop.
+// offered tools to the in-bounds content experts; `key` (optional) confines every spoke call to a content SLICE (a
+// subset of a large expert — e.g. a tutor on one chapter of a whole book). Empty → the normal open tools loop.
 static Result run_tools_loop(const json& client_messages, const std::string& system_override = "",
-                             const std::set<std::string>& scope = {}) {
+                             const std::set<std::string>& scope = {}, const std::string& key = "") {
     Result r;
     r.mode = "tools";
     json msgs = client_messages.is_array() ? client_messages : json::array();
@@ -588,12 +609,12 @@ static Result run_tools_loop(const json& client_messages, const std::string& sys
             int mx = args.value("max", 20);
             std::vector<Match> ms;
             if (name == "list_matching") {
-                ms = retrieve_all(q, section, mx);                        // generic: fan /retrieve to all spokes
+                ms = retrieve_all(q, section, mx, key);                   // generic: fan /retrieve to all spokes (in slice)
             } else {                                                      // list_<spoke>: one expert
                 std::string sn = name.substr(5);
                 const Spoke* sp = nullptr;
                 for (const auto& s : g_spokes) if (s.name == sn) sp = &s;
-                if (sp) ms = retrieve_spoke(*sp, q, section, mx);
+                if (sp) ms = retrieve_spoke(*sp, q, section, mx, key);
             }
             if (g_verbose) fprintf(stderr, "[claymore] %s(query=\"%s\", section=\"%s\") → %zu passage(s)\n", name.c_str(), q.c_str(), section.c_str(), ms.size());
             if (ms.empty()) return "(no matching passages)";
@@ -630,7 +651,7 @@ static Result run_tools_loop(const json& client_messages, const std::string& sys
             return toolres;
         }
         if (name == "consult_experts") {                                  // generic: claymore fan-out-routes
-            auto ranked = fan_out(q);
+            auto ranked = fan_out(q, key);
             if (g_verbose) fprintf(stderr, "[claymore] consult_experts(query=\"%s\") → %zu non-abstaining spoke(s)\n", q.c_str(), ranked.size());
             if (ranked.empty()) toolres = "(no expert covers that — all abstained)";
             for (int k = 0; k < (int)ranked.size() && k < g_top_k; k++) {
@@ -644,7 +665,7 @@ static Result run_tools_loop(const json& client_messages, const std::string& sys
             const Spoke* sp = nullptr;
             for (const auto& s : g_spokes) if (s.name == sn) sp = &s;
             if (sp) {
-                SAns a = ask_spoke(*sp, q);
+                SAns a = ask_spoke(*sp, q, key);
                 if (g_verbose) fprintf(stderr, "[claymore] %s(query=\"%s\") → %s\n", name.c_str(), q.c_str(), a.ok ? "answered" : "abstained");
                 if (a.ok) {
                     std::string cite = !a.citation.empty() ? a.citation : a.source;
@@ -788,6 +809,7 @@ static std::string render_json(const Result& r) {
     j["sources"] = srcs;
     if (!r.route.empty()) j["route"] = r.route;       // provenance tier (RETRIEVED|SELECTED|COMPOSED)
     if (r.margin < 1e8) j["margin"] = r.margin;       // thinnest-decision margin (fragile-link signal)
+    if (!r.suggestions.empty()) j["suggestions"] = r.suggestions;   // tutor: suggested next prompts for the learner
     return j.dump();
 }
 
@@ -936,28 +958,77 @@ static std::string fill_vars(std::string s, const json& vars) {
     return s;
 }
 
-struct Session { bool ok = false; std::string system; std::set<std::string> scope; };
+struct Session { bool ok = false; std::string system, opening, suggest, note, key; std::set<std::string> scope; };
 
 // Assemble a teaching session from the request's "session" object: resolve the template (inline `template_text`, else
 // fetched from the pedagogy expert by `template`), bind the scope (explicit `scope`, else all content experts), fill
 // {scope}/{objectives}/{content}/vars, and append the HARD guardrail. The tutor then gets tools ONLY for the scope.
 static Session assemble_session(const json& sess) {
     Session s;
+    // requested scope: explicit `scope`, else all content experts (no pedagogy/librarian meta-roles).
+    std::set<std::string> requested;
     if (sess.contains("scope") && sess["scope"].is_array())
-        for (const auto& x : sess["scope"]) s.scope.insert(x.get<std::string>());
+        for (const auto& x : sess["scope"]) requested.insert(x.get<std::string>());
     else
         for (const auto& sp : g_spokes)
-            if (sp.role != "pedagogy" && sp.role != "librarian") s.scope.insert(sp.name);   // default = content experts
-    std::string scope_desc;
-    for (const auto& sp : g_spokes)
-        if (s.scope.count(sp.name)) scope_desc += (scope_desc.empty() ? "" : ", ") + sp.name + " (" + sp.domain + ")";
-    if (scope_desc.empty()) scope_desc = "the available experts";
+            if (sp.role != "pedagogy" && sp.role != "librarian") requested.insert(sp.name);
 
     std::string tmpl = sess.value("template_text", "");           // caller-inline template wins; else the library
     if (tmpl.empty()) tmpl = fetch_template(sess.value("template", "tutor"));
     if (tmpl.empty())                                            // no pedagogy expert / no match → graceful built-in
         tmpl = "You are a bounded tutor for {scope}. Teach toward {objectives} using ONLY the expert tools; ask guiding "
                "questions one at a time and cite each fact. {content}";
+
+    // Split off the tutor-metadata tail (opener + suggestions + scope restriction) the adapter packs after the sentinel.
+    std::string opening_tmpl = sess.value("opening_text", "");    // caller-inline opener wins
+    std::string suggest_tmpl = sess.value("suggest_text", "");
+    std::vector<std::string> applies; std::string subject;
+    size_t mp = tmpl.find(TUTOR_META);
+    if (mp != std::string::npos) {
+        std::string tail = trim(tmpl.substr(mp + TUTOR_META.size()));
+        tmpl = trim(tmpl.substr(0, mp));
+        try {
+            json meta = json::parse(tail);
+            if (opening_tmpl.empty()) opening_tmpl = meta.value("opening", "");
+            if (suggest_tmpl.empty()) suggest_tmpl = meta.value("suggest", "");
+            subject = meta.value("subject", "");
+            if (meta.contains("applies_to") && meta["applies_to"].is_array())
+                for (const auto& x : meta["applies_to"]) applies.push_back(x.get<std::string>());
+        } catch (...) {}                                          // a malformed tail just means "no restriction/opener"
+    }
+
+    // SCOPE RESTRICTION: if the tutor declares which experts it applies to, intersect the requested scope with them —
+    // explicit `applies_to` names ∪ a lexical subject↔(name+domain) match. An empty restriction applies to all.
+    if (!applies.empty() || !subject.empty()) {
+        std::set<std::string> allowed;
+        for (const auto& sp : g_spokes) {
+            if (!sp.role.empty()) continue;                       // content experts only
+            bool ok = false;
+            for (const auto& a : applies) if (sp.name == a) { ok = true; break; }
+            if (!ok && !subject.empty() && relevance(subject, sp.name + " " + sp.domain) >= TUTOR_SUBJECT_MIN) ok = true;
+            if (ok) allowed.insert(sp.name);
+        }
+        std::set<std::string> dropped;
+        for (auto it = requested.begin(); it != requested.end();)
+            if (allowed.count(*it)) ++it; else { dropped.insert(*it); it = requested.erase(it); }
+        if (!dropped.empty()) {
+            std::string d; for (const auto& n : dropped) d += (d.empty() ? "" : ", ") + n;
+            s.note = "tutor scope restricted — dropped out-of-subject expert(s): " + d;
+        }
+        if (requested.empty()) {                                 // restricted to nothing in scope → don't start
+            std::string allow; for (const auto& n : allowed) allow += (allow.empty() ? "" : ", ") + n;
+            s.note = "this tutor applies only to {" + (allow.empty() ? std::string("<no matching expert>") : allow) +
+                     "} — none in scope; not starting";
+            s.ok = false;
+            return s;
+        }
+    }
+    s.scope = requested;
+
+    std::string scope_desc;
+    for (const auto& sp : g_spokes)
+        if (s.scope.count(sp.name)) scope_desc += (scope_desc.empty() ? "" : ", ") + sp.name + " (" + sp.domain + ")";
+    if (scope_desc.empty()) scope_desc = "the available experts";
 
     json vars = sess.value("variables", json::object());
     vars["scope"] = scope_desc;
@@ -966,8 +1037,57 @@ static Session assemble_session(const json& sess) {
     s.system = fill_vars(tmpl, vars) +
                "\n\nGround every factual claim in the expert tools provided; you have tools ONLY for the in-scope "
                "experts (" + scope_desc + "). If the student goes outside that scope, say so and redirect. Keep citations.";
+    // The opener (if any) is the template's own scaffold, filled with the same vars — claymore adds NO wording of its
+    // own (the authored pedagogy lives in the template, not the binary). It's run as a kickoff turn so the tutor speaks
+    // first; the system prompt's grounding guardrail (the in-code hard promise) still governs it.
+    if (!opening_tmpl.empty()) s.opening = fill_vars(opening_tmpl, vars);
+    if (!suggest_tmpl.empty()) s.suggest = fill_vars(suggest_tmpl, vars);
+    s.key = sess.value("key", "");                                // confine the whole session to a content slice (subset key)
     s.ok = true;
     return s;
+}
+
+// Suggested next prompts for the learner, from the session's `suggest` scaffold (authored in the template). One plain
+// no-tools completion reflecting on the conversation; claymore adds only the machine FORMAT contract (a JSON array of
+// strings), never teaching wording. Returns [] with no scaffold or if the model didn't produce a usable list.
+static std::vector<std::string> gen_suggestions(const json& history, const Session& ses) {
+    std::vector<std::string> out;
+    if (ses.suggest.empty() || g_synth.value("url", "").empty()) return out;
+    json msgs = json::array();
+    msgs.push_back(json{{"role", "system"}, {"content", ses.system}});
+    for (const auto& m : history) msgs.push_back(m);
+    msgs.push_back(json{{"role", "user"}, {"content",
+        ses.suggest + " Reply with ONLY a JSON array of short plain-text strings (the prompts), nothing else."}});
+    json m = llm_turn(msgs, json::array());                       // empty tools → a plain completion, no spoke calls
+    if (m.is_null()) return out;
+    std::string c = m.value("content", "");
+    size_t a = c.find('['), b = c.rfind(']');
+    if (a != std::string::npos && b != std::string::npos && b > a) {
+        try {
+            json arr = json::parse(c.substr(a, b - a + 1));
+            if (arr.is_array())
+                for (const auto& x : arr)
+                    if (x.is_string() && !x.get<std::string>().empty()) out.push_back(x.get<std::string>());
+        } catch (...) {}
+    }
+    if (out.empty() && !c.empty()) {                              // fallback: split bullets / numbered lines
+        std::stringstream ss(c); std::string ln;
+        while (std::getline(ss, ln)) {
+            size_t p = ln.find_first_not_of(" \t-*•0123456789.)");
+            if (p != std::string::npos) out.push_back(ln.substr(p));
+        }
+    }
+    if (out.size() > 5) out.resize(5);                            // a sane cap regardless of the template
+    return out;
+}
+
+// Print a suggestions block to the REPL (dim header on a TTY). No-op when empty.
+static void print_suggestions(const std::vector<std::string>& sugs) {
+    if (sugs.empty()) return;
+    std::string blk;
+    for (size_t k = 0; k < sugs.size(); ++k) blk += "  " + std::to_string(k + 1) + ". " + sugs[k] + "\n";
+    printf("%s%s", g_tty ? "\x1b[2mSuggestions:\x1b[22m\n" : "Suggestions:\n", blk.c_str());
+    fflush(stdout);
 }
 
 static void handle(const httplib::Request& req, httplib::Response& res, const std::string& route) {
@@ -977,8 +1097,22 @@ static void handle(const httplib::Request& req, httplib::Response& res, const st
     Result r;
     if (body.contains("session") && body["session"].is_object() && !g_synth.value("url", "").empty()) {
         Session ses = assemble_session(body["session"]);          // a teaching session: pedagogy prompt + scoped tools
-        if (ses.ok) { r = run_tools_loop(body.value("messages", json::array()), ses.system, ses.scope); }
-        else { r.body = REFUSE; r.mode = "abstain"; }             // no template could be resolved
+        if (ses.ok) {
+            json msgs = body.value("messages", json::array());
+            bool has_user = false;
+            for (const auto& m : msgs) if (m.value("role", "") == "user") { has_user = true; break; }
+            // Kickoff: with an opener and no learner turn yet, the tutor speaks FIRST (set session.kickoff:false to opt out).
+            bool kicked = !ses.opening.empty() && !has_user && body["session"].value("kickoff", true);
+            if (kicked)
+                r = run_tools_loop(json::array({json{{"role", "user"}, {"content", ses.opening}}}), ses.system, ses.scope, ses.key);
+            else
+                r = run_tools_loop(msgs, ses.system, ses.scope, ses.key);
+            if (!ses.suggest.empty() && wants_json(body)) {       // structured consumers get suggested next prompts
+                json hist = kicked ? json::array() : msgs;
+                hist.push_back(json{{"role", "assistant"}, {"content", r.body}});
+                r.suggestions = gen_suggestions(hist, ses);
+            }
+        } else { r.body = ses.note.empty() ? REFUSE : ses.note; r.mode = "abstain"; }   // no template / restricted out of scope
     } else if (g_mode == "tools" && !g_synth.value("url", "").empty()) {
         r = run_tools_loop(body.value("messages", json::array()));  // agentic: LLM calls spokes as tools
     } else {
@@ -1011,6 +1145,7 @@ int main(int argc, char** argv) {
         sp.name = s.value("name", "");
         sp.domain = s.value("domain", "");
         sp.role = s.value("role", "");                            // "" content expert | "librarian" catalog
+        sp.key = s.value("key", "");                              // optional subset key → a slice of a larger expert
         for (const char* key : {"urls", "replicas"})
             if (s.contains(key) && s[key].is_array())
                 for (auto& u : s[key]) sp.urls.push_back(u.get<std::string>());
@@ -1045,11 +1180,13 @@ int main(int argc, char** argv) {
 
     if (repl) {  // CLI: content Q&A by default; enter a MENTORING SESSION with /session (no server)
         bool have_llm = !g_synth.value("url", "").empty();
+        g_tty = isatty(fileno(stdout));                           // render markdown/TeX only for an interactive terminal
         fprintf(stderr, "claymore REPL — content Q&A by default.\n"
                         "  /catalog                      list the federated catalog (the librarian — what exists)\n"
                         "  /tutors                       list teaching templates (the pedagogy expert)\n"
                         "  /experts                      list content experts (what you can study)\n"
-                        "  /session <tutor> [on <e>…]    start a mentoring session (e.g. /session socratic-tutor on riscv)\n"
+                        "  /session <tutor> [on <e>…] [key <subset>]   mentoring session, optionally confined to a content\n"
+                        "                                slice (e.g. /session socratic-tutor on book key Chapter 3)\n"
                         "  /end                          leave the session (back to Q&A)    /help    blank line = quit\n");
         Session session;                                          // current mentoring session (ok=false → not in one)
         std::string session_name;
@@ -1091,10 +1228,13 @@ int main(int argc, char** argv) {
                     }
                     if (!any) fprintf(stderr, "  (no pedagogy expert configured — a role:\"pedagogy\" spoke)\n");
                 } else if (cmd == "session") {
-                    std::string tok, tmpl, on; std::vector<std::string> scope;
-                    while (ss >> tok) {                           // "<tutor words…> [on <expert>…]"
-                        if (tok == "on") { on = tok; continue; }
-                        if (on.empty()) tmpl += (tmpl.empty() ? "" : " ") + tok; else scope.push_back(tok);
+                    std::string tok, tmpl, subkey; std::vector<std::string> scope; int phase = 0;  // 0=tutor 1=experts 2=key
+                    while (ss >> tok) {                           // "<tutor words…> [on <expert>…] [key <subset words…>]"
+                        if (tok == "on") { phase = 1; continue; }
+                        if (tok == "key") { phase = 2; continue; }
+                        if (phase == 0) tmpl += (tmpl.empty() ? "" : " ") + tok;
+                        else if (phase == 1) scope.push_back(tok);
+                        else subkey += (subkey.empty() ? "" : " ") + tok;
                     }
                     if (!have_llm) { fprintf(stderr, "  sessions need a synthesis LLM (set \"synthesis\" in the config)\n"); continue; }
                     auto low = [](std::string x) { for (auto& c : x) if (c >= 'A' && c <= 'Z') c += 32; return x; };
@@ -1125,11 +1265,30 @@ int main(int argc, char** argv) {
                     }
                     json sess; sess["template"] = tmpl.empty() ? "tutor" : tmpl;
                     if (!scope.empty()) sess["scope"] = scope;
+                    if (!subkey.empty()) sess["key"] = subkey;    // confine the tutor to a subset (a slice of a big expert)
                     Session s = assemble_session(sess);
-                    if (!s.ok) { fprintf(stderr, "  couldn't start a session (no template / pedagogy expert)\n"); continue; }
+                    if (!s.ok) {
+                        fprintf(stderr, "  couldn't start a session — %s\n",
+                                s.note.empty() ? "no template / pedagogy expert" : s.note.c_str());
+                        continue;
+                    }
+                    if (!s.note.empty()) fprintf(stderr, "  %s\n", s.note.c_str());
                     session = s; session_name = tmpl.empty() ? "tutor" : tmpl; history = json::array();
                     std::string sc; for (const auto& n : session.scope) sc += (sc.empty() ? "" : ", ") + n;
-                    fprintf(stderr, "  entered '%s' on [%s] — start talking; /end to leave\n", session_name.c_str(), sc.c_str());
+                    if (session.key.empty())
+                        fprintf(stderr, "  entered '%s' on [%s] — start talking; /end to leave\n", session_name.c_str(), sc.c_str());
+                    else
+                        fprintf(stderr, "  entered '%s' on [%s] · subset key '%s' — start talking; /end to leave\n",
+                                session_name.c_str(), sc.c_str(), session.key.c_str());
+                    if (!session.opening.empty()) {               // tutor speaks first: run the template's opener as a kickoff turn
+                        json seed = json::array({json{{"role", "user"}, {"content", session.opening}}});
+                        Result o = run_tools_loop(seed, session.system, session.scope, session.key);
+                        history.push_back(seed[0]);
+                        history.push_back(json{{"role", "assistant"}, {"content", o.body}});
+                        printf("%s\n", g_tty ? mdterm::render(render_text(o), true).c_str() : render_text(o).c_str());
+                        fflush(stdout);
+                        print_suggestions(gen_suggestions(history, session));
+                    }
                 } else if (cmd == "end") {
                     session = Session{}; session_name.clear(); history = json::array();
                     fprintf(stderr, "  left the session\n");
@@ -1142,15 +1301,16 @@ int main(int argc, char** argv) {
             Result r;
             if (session.ok) {                                     // ---- a turn IN the mentoring session ----
                 history.push_back(json{{"role", "user"}, {"content", line}});
-                r = run_tools_loop(history, session.system, session.scope);
+                r = run_tools_loop(history, session.system, session.scope, session.key);
                 history.push_back(json{{"role", "assistant"}, {"content", r.body}});
             } else {                                              // ---- default content Q&A ----
                 r = (g_mode == "tools" && have_llm)
                         ? run_tools_loop(json::array({json{{"role", "user"}, {"content", line}}}))
                         : hub_answer(line);
             }
-            printf("%s\n", render_text(r).c_str());
+            printf("%s\n", g_tty ? mdterm::render(render_text(r), true).c_str() : render_text(r).c_str());
             fflush(stdout);
+            if (session.ok) print_suggestions(gen_suggestions(history, session));
         }
         return 0;
     }

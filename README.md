@@ -90,6 +90,26 @@ how many RISC-V instructions are there?   # back to plain Q&A (fans out to the e
 
 Tear the whole stack down with `pkill -f 'llama-server|build/sgiandubh|build/claymore'`.
 
+**REPL rendering.** On an interactive terminal the REPL renders **Markdown and inline TeX / MathML math** (headings,
+bold/italic, code blocks, lists, and `$…$` / `\(…\)` / `$$…$$` / `<math>…</math>` → Unicode). It's TTY-gated: piped
+output stays raw, so scripts and tests are unaffected.
+
+**Subset experts (a key into a large expert).** A spoke may carry an optional `"key"`: claymore forwards it on every
+call so that spoke sees only the **slice** of the expert's content whose section/id matches the key. Two spoke entries
+can share one `url` but differ in `key` — one big sgiandubh fronted as several bounded subset-experts (e.g. a `riscv`
+spoke and a `riscv-vector` spoke with `"key": "V Extension"` over the same server). Off-slice queries abstain.
+
+**Teaching sessions** (`/session`, or a request `session` object) are driven by pedagogy templates built by
+[rosetta](https://github.com/jascal/rosetta). Beyond the system scaffold a template may carry: an **opener** (the tutor
+speaks first), **suggested next prompts** (shown after each turn), and a **scope restriction** (`applies_to`/`subject` —
+which experts the tutor may be applied to). All of that wording lives in the template, not in claymore — the binary adds
+only the in-code safety guardrail.
+
+**A tutor on a slice of one expert.** The session and subset features compose: give a session a `key` and the tutor is
+confined to that slice on every tool call — e.g. a tutor on a whole-book expert restricted to one chapter. In the REPL:
+`/session socratic-tutor on book key Chapter 3`; via the API: `{"session": {"template": "...", "scope": ["book"],
+"key": "Chapter 3"}}`. (You can also pre-bake a subset as its own keyed spoke and start the tutor on that — same effect.)
+
 ## Why the abstain-router works
 Every sgiandubh spoke answers only its own material and abstains otherwise, so claymore doesn't need a trained
 router: ask everyone (each call is sub-millisecond), keep whoever didn't abstain. Add a textbook → add a spoke line.
