@@ -22,6 +22,20 @@
         "http://localhost:8401",
         "http://localhost:8402"
       ]
+    },
+    {
+      "name": "papers",
+      "role": "librarian",
+      "domain": "document catalog (the librarian \u2014 backs find_document/catalog tools)",
+      "url": "http://localhost:8200"
+    },
+    {
+      "name": "math-hub",
+      "domain": "a sub-hub of math experts (federated claymore)",
+      "replicas": [
+        "http://localhost:9101",
+        "http://localhost:9102"
+      ]
     }
   ],
   "mode": "deterministic",
@@ -31,6 +45,17 @@
     "model": "local-model",
     "format": "openai",
     "api_key_env": "OPENAI_API_KEY",
-    "max_tokens": 1024
+    "max_tokens": 1024,
+    "backends": [
+      {
+        "url": "http://localhost:8080/v1",
+        "model": "local-model"
+      },
+      {
+        "url": "http://localhost:8081/v1",
+        "model": "local-llama",
+        "api_key_env": "NONE"
+      }
+    ]
   }
 }

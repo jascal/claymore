@@ -25,9 +25,10 @@
 #include <vector>
 using json = nlohmann::json;
 
-// A spoke can front N REDUNDANT replicas of the same expert (identical sgiandubh copies) — for reliability (failover)
-// and scale (load spread). One `url` in spokes.json → one replica; `urls`/`replicas` arrays → many.
-struct Spoke { std::string name, domain; std::vector<std::string> urls; };
+// A spoke can front N REDUNDANT replicas of the same expert (identical sgiandubh copies — or another claymore, since
+// they share an API) for reliability (failover) + scale (load spread). One `url` → one replica; `urls`/`replicas` → many.
+// role: "" = a content expert (fanned out + ask/list/lookup); "librarian" = a catalog expert backing find/catalog tools.
+struct Spoke { std::string name, domain, role; std::vector<std::string> urls; };
 struct SAns {
     std::string answer, kind, citation, citation_id, source, spoke, route;  // route: RETRIEVED|SELECTED|COMPOSED tier
     double confidence = -1;                         // citation_id = the spoke's callable handle (→ /lookup)
@@ -169,8 +170,9 @@ static double score(const SAns& a) {
 
 static std::vector<SAns> fan_out(const std::string& query) {
     std::vector<std::future<SAns>> futs;
-    for (const auto& sp : g_spokes)
-        futs.push_back(std::async(std::launch::async, ask_spoke, std::cref(sp), std::cref(query)));
+    for (const auto& sp : g_spokes)                       // every spoke participates — a catalog expert answers catalog
+        futs.push_back(std::async(std::launch::async, ask_spoke, std::cref(sp), std::cref(query)));  // queries, the
+    // relevance gate drops its cards from unrelated answers. (No exclusion — librarians must federate, not be hidden.)
     std::vector<SAns> res;
     for (auto& f : futs) { SAns a = f.get(); if (a.ok) res.push_back(a); }
     std::sort(res.begin(), res.end(), [](const SAns& x, const SAns& y) { return score(x) > score(y); });
@@ -203,7 +205,7 @@ static std::vector<Match> retrieve_spoke(const Spoke& sp, const std::string& que
 
 static std::vector<Match> retrieve_all(const std::string& query, const std::string& section, int max) {
     std::vector<std::future<std::vector<Match>>> futs;
-    for (const auto& sp : g_spokes)
+    for (const auto& sp : g_spokes)                       // all spokes — a catalog expert returns its document cards
         futs.push_back(std::async(std::launch::async, retrieve_spoke, std::cref(sp),
                                   std::cref(query), std::cref(section), max));
     std::vector<Match> all;
@@ -241,21 +243,39 @@ static json spoke_health() {
     return arr;
 }
 
-// ---- hub LLM (llm mode): local llama.cpp server OR remote API; OpenAI- or Anthropic-shaped ---------------------
-static std::string call_synth(const std::string& prompt) {
+// ---- hub LLM (llm + tools modes): local llama.cpp server OR remote API; OpenAI- or Anthropic-shaped --------------
+// The hub LLM (synthesis + tools routing) can be made REDUNDANT: g_synth["backends"] is an array of endpoint configs
+// (each may differ — e.g. a primary API, a fallback provider, a local model). Each inherits the top-level g_synth
+// fields and overrides them. With no "backends", g_synth itself is the single backend (back-compat).
+static std::vector<json> synth_backends() {
+    std::vector<json> v;
+    if (g_synth.contains("backends") && g_synth["backends"].is_array() && !g_synth["backends"].empty()) {
+        for (const auto& b : g_synth["backends"]) {
+            json m = g_synth;
+            m.erase("backends");
+            m.merge_patch(b);                                 // backend overrides the inherited defaults
+            v.push_back(m);
+        }
+    } else {
+        v.push_back(g_synth);
+    }
+    return v;
+}
+
+static std::string call_synth_cfg(const json& cfg, const std::string& prompt) {
     std::string origin, base;
-    split_url(g_synth.value("url", ""), origin, base);
+    split_url(cfg.value("url", ""), origin, base);
     if (origin.empty()) return "";
     httplib::Client cli(origin);
     cli.set_connection_timeout(10);
     cli.set_read_timeout(120);
-    const char* key = std::getenv(g_synth.value("api_key_env", "OPENAI_API_KEY").c_str());
+    const char* key = std::getenv(cfg.value("api_key_env", "OPENAI_API_KEY").c_str());
     std::string keystr = key ? key : "";                  // local llama.cpp needs no key; the header is harmless
-    if (g_synth.value("format", "openai") == "anthropic") {
+    if (cfg.value("format", "openai") == "anthropic") {
         httplib::Headers h = {{"x-api-key", keystr}, {"anthropic-version", "2023-06-01"}};
         json req;
-        req["model"] = g_synth.value("model", "claude-3-5-haiku-latest");
-        req["max_tokens"] = g_synth.value("max_tokens", 1024);
+        req["model"] = cfg.value("model", "claude-3-5-haiku-latest");
+        req["max_tokens"] = cfg.value("max_tokens", 1024);
         req["messages"] = json::array({json{{"role", "user"}, {"content", prompt}}});
         auto res = cli.Post(base + "/v1/messages", h, req.dump(), "application/json");
         if (!res || res->status != 200) return "";
@@ -263,11 +283,22 @@ static std::string call_synth(const std::string& prompt) {
     }
     httplib::Headers h = {{"Authorization", std::string("Bearer ") + keystr}};
     json req;
-    req["model"] = g_synth.value("model", "gpt-4o-mini");
+    req["model"] = cfg.value("model", "gpt-4o-mini");
     req["messages"] = json::array({json{{"role", "user"}, {"content", prompt}}});
     auto res = cli.Post(base + "/chat/completions", h, req.dump(), "application/json");  // llama.cpp + OpenAI shape
     if (!res || res->status != 200) return "";
     try { return json::parse(res->body)["choices"][0]["message"]["content"].get<std::string>(); } catch (...) { return ""; }
+}
+
+// Try each synth backend (round-robin start + failover) until one returns a non-empty answer.
+static std::string call_synth(const std::string& prompt) {
+    auto bs = synth_backends();
+    unsigned start = g_rr.fetch_add(1, std::memory_order_relaxed);
+    for (size_t i = 0; i < bs.size(); i++) {
+        std::string out = call_synth_cfg(bs[(start + i) % bs.size()], prompt);
+        if (!out.empty()) return out;
+    }
+    return "";
 }
 
 // ---- federated handle resolution -------------------------------------------------------------------------------
@@ -290,6 +321,40 @@ static json lookup_spoke(const Spoke& sp, const std::string& id) {
         } catch (...) { return false; }
     });
     return out;
+}
+
+// ---- federated librarian: aggregate every spoke's /catalog ------------------------------------------------------
+// Each spoke contributes cards via its /catalog: a leaf sgiandubh its degenerate self-card (or a catalog package's
+// document cards); a CHILD CLAYMORE its own federated catalog (recursion). So the catalog rolls up the hierarchy —
+// no node is excluded. With replicas/failover, like every other federated call.
+static json catalog_spoke(const Spoke& sp, int depth) {
+    json cards = json::array();
+    call_replica(sp, [&](const std::string& origin, const std::string& base) -> bool {
+        httplib::Client cli(origin);
+        cli.set_connection_timeout(5);
+        cli.set_read_timeout(15);
+        auto res = cli.Get(base + "/catalog?depth=" + std::to_string(depth));   // pass the remaining recursion budget
+        if (!res || res->status != 200) return false;             // spoke lacks /catalog (older build) → fail over / skip
+        try {
+            for (auto& c : json::parse(res->body).value("cards", json::array())) {
+                json cc = c;
+                cc["spoke"] = sp.name;                             // tag provenance: which spoke this card came from
+                cards.push_back(cc);
+            }
+            return true;
+        } catch (...) { return false; }
+    });
+    return cards;
+}
+// Recursion-BOUNDED roll-up: each hub level decrements `depth`; at 0 we stop descending (a misconfigured cycle
+// A→B→A terminates after `depth` hops instead of looping over HTTP). A leaf sgiandubh ignores ?depth. A spoke that's
+// down contributes nothing (call_replica → empty) and the rest still aggregate — partial results, never a hard fail.
+static json federate_catalog(int depth = 4) {
+    json all = json::array();
+    if (depth <= 0) return all;
+    for (const auto& sp : g_spokes)
+        for (auto& c : catalog_spoke(sp, depth - 1)) all.push_back(c);
+    return all;
 }
 
 // ---- modes -----------------------------------------------------------------------------------------------------
@@ -407,31 +472,58 @@ static json spoke_tools() {
         kf["parameters"] = lookup_param();
         tools.push_back(json{{"type", "function"}, {"function", kf}});
     }
+    // LIBRARIAN tools — the catalog is UNIVERSAL (every spoke exposes /catalog; this hub federates them), so these are
+    // always offered. catalog() = the directory of experts/collections; find_document() = search across them.
+    if (!g_spokes.empty()) {
+        json cf;
+        cf["name"] = "catalog";
+        cf["description"] = "List the federated catalog — every expert/collection this hub fronts (each card names a "
+                            "content expert + what it covers). Use to discover WHAT exists before consulting an expert.";
+        cf["parameters"] = list_param();
+        tools.push_back(json{{"type", "function"}, {"function", cf}});
+        json ff;
+        ff["name"] = "find_document";
+        ff["description"] = "Search the catalogs for documents/passages on a topic, across all experts. Returns cited "
+                            "cards/passages whose handle points INTO a content expert — then ask/lookup that expert.";
+        ff["parameters"] = query_param();
+        tools.push_back(json{{"type", "function"}, {"function", ff}});
+    }
     return tools;
 }
 
 // One tool-capable LLM turn (OpenAI shape). Returns the assistant message, or null on failure.
-static json llm_turn(const json& messages, const json& tools) {
+static json llm_turn_cfg(const json& cfg, const json& messages, const json& tools) {
     std::string origin, base;
-    split_url(g_synth.value("url", ""), origin, base);
+    split_url(cfg.value("url", ""), origin, base);
     httplib::Client cli(origin);
     cli.set_connection_timeout(10);
     cli.set_read_timeout(120);
-    const char* key = std::getenv(g_synth.value("api_key_env", "OPENAI_API_KEY").c_str());
+    const char* key = std::getenv(cfg.value("api_key_env", "OPENAI_API_KEY").c_str());
     httplib::Headers h = {{"Authorization", std::string("Bearer ") + (key ? key : "")}};
     json req;
-    req["model"] = g_synth.value("model", "gpt-4o-mini");
+    req["model"] = cfg.value("model", "gpt-4o-mini");
     req["messages"] = messages;
     if (!tools.empty()) { req["tools"] = tools; req["tool_choice"] = "auto"; }
     auto res = cli.Post(base + "/chat/completions", h, req.dump(), "application/json");
     if (!res || res->status != 200) {
         std::string why = res ? ("HTTP " + std::to_string(res->status) + " — " + res->body.substr(0, 300))
                               : std::string("no response (is the model at the synthesis url up?)");
-        fprintf(stderr, "[claymore] hub LLM call failed: %s\n", why.c_str());  // always: this is the usual cause of a spurious refuse
+        fprintf(stderr, "[claymore] hub LLM call failed: %s\n", why.c_str());  // the usual cause of a spurious refuse
         return json(nullptr);
     }
     try { return json::parse(res->body)["choices"][0]["message"]; }
     catch (...) { fprintf(stderr, "[claymore] hub LLM: unparseable response: %s\n", res->body.substr(0, 300).c_str()); return json(nullptr); }
+}
+
+// Redundant tools-mode turn: try each synth backend (round-robin + failover) until one returns a message.
+static json llm_turn(const json& messages, const json& tools) {
+    auto bs = synth_backends();
+    unsigned start = g_rr.fetch_add(1, std::memory_order_relaxed);
+    for (size_t i = 0; i < bs.size(); i++) {
+        json m = llm_turn_cfg(bs[(start + i) % bs.size()], messages, tools);
+        if (!m.is_null()) return m;
+    }
+    return json(nullptr);
 }
 
 static Result run_tools_loop(const json& client_messages) {
@@ -486,6 +578,32 @@ static Result run_tools_loop(const json& client_messages) {
             if (ms.empty()) return "(no matching passages)";
             for (const auto& m : ms) {
                 toolres += "- " + m.passage + (m.section.empty() ? "" : ("  (source: " + m.section + ")")) + "\n";
+                r.sources.push_back({m.spoke, m.section, cite_id(m.section)});
+            }
+            return toolres;
+        }
+        // CATALOG tool → the federated directory: every expert/collection this hub (recursively) fronts.
+        if (name == "catalog") {
+            json cards = federate_catalog();
+            if (g_verbose) fprintf(stderr, "[claymore] catalog → %zu card(s)\n", cards.size());
+            if (cards.empty()) return "(empty catalog)";
+            for (auto& c : cards) {
+                std::string label = c.contains("title") ? c.value("title", "") : c.value("summary", "");
+                std::string h = c.value("handle", "");
+                toolres += "- [" + c.value("spoke", "") + "] " + label + (h.empty() ? "" : ("  (handle: " + h + ")")) + "\n";
+            }
+            return toolres;
+        }
+        // FIND_DOCUMENT → search content + catalog spokes for matching passages/cards (handles point INTO experts).
+        if (name == "find_document") {
+            std::string section = args.value("section", "");
+            int mx = args.value("max", 8);
+            auto ms = retrieve_all(q, section, mx);
+            if (g_verbose) fprintf(stderr, "[claymore] find_document(query=\"%s\") → %zu hit(s)\n", q.c_str(), ms.size());
+            if (ms.empty()) return "(nothing in the catalogs matches)";
+            for (const auto& m : ms) {
+                toolres += "- " + m.passage +
+                           (m.section.empty() ? "" : ("  (handle: " + cite_id(m.section) + ", spoke: " + m.spoke + ")")) + "\n";
                 r.sources.push_back({m.spoke, m.section, cite_id(m.section)});
             }
             return toolres;
@@ -632,6 +750,13 @@ static std::string render_json(const Result& r) {
     json j;
     j["answer"] = r.body;
     j["mode"] = r.mode;
+    // sgiandubh-compatible FLAT fields, so a PARENT claymore (or any client) parses this hub exactly like a leaf
+    // spoke — this is what makes claymores nest (federated claymores). kind=abstain → the parent treats it as an abstain.
+    j["kind"] = (r.mode == "abstain") ? "abstain" : "federated";
+    if (!r.sources.empty()) {
+        if (!r.sources[0].citation.empty()) j["citation"] = r.sources[0].citation;
+        if (!r.sources[0].id.empty()) j["citation_id"] = r.sources[0].id;
+    }
     json srcs = json::array();
     for (auto& s : r.sources) {                                       // each source carries its callable handle (spoke,id)
         json o; o["spoke"] = s.spoke;
@@ -784,6 +909,7 @@ int main(int argc, char** argv) {
         Spoke sp;
         sp.name = s.value("name", "");
         sp.domain = s.value("domain", "");
+        sp.role = s.value("role", "");                            // "" content expert | "librarian" catalog
         for (const char* key : {"urls", "replicas"})
             if (s.contains(key) && s[key].is_array())
                 for (auto& u : s[key]) sp.urls.push_back(u.get<std::string>());
@@ -810,8 +936,8 @@ int main(int argc, char** argv) {
     for (const auto& h : health) {
         bool up = h.value("up", false);
         if (up) nup++;
-        fprintf(stderr, "  spoke %-10s %-30s %s\n", h.value("name", "").c_str(), h.value("url", "").c_str(),
-                up ? "UP" : "DOWN (unreachable)");
+        fprintf(stderr, "  spoke %-12s %-7s %d/%d replicas up  %s\n", h.value("name", "").c_str(),
+                up ? "UP" : "DOWN", h.value("replicas_up", 0), h.value("replicas_total", 0), h.value("domain", "").c_str());
     }
     if (nup == 0)
         fprintf(stderr, "  WARNING: no spokes reachable — start the sgiandubh spoke servers first.\n");
@@ -884,6 +1010,25 @@ int main(int argc, char** argv) {
     };
     svr.Get("/lookup", lookup_handler);
     svr.Post("/lookup", lookup_handler);
+    // Federated /retrieve — the sgiandubh extension, fanned across this hub's content spokes. So a PARENT claymore can
+    // list-retrieve from this hub exactly as from a leaf (claymores nest: same API surface, replicas for HA).
+    svr.Post("/retrieve", [](const httplib::Request& q, httplib::Response& res) {
+        json b;
+        try { b = json::parse(q.body); } catch (...) { b = json::object(); }
+        auto ms = retrieve_all(b.value("query", ""), b.value("section", ""), b.value("k", 20));
+        json matches = json::array();
+        for (const auto& m : ms)
+            matches.push_back(json{{"section", m.section}, {"passage", m.passage}, {"score", m.score}});
+        json out; out["object"] = "retrieve"; out["matches"] = matches;
+        res.set_content(out.dump(), "application/json");
+    });
+    // Federated /catalog — aggregate every spoke's /catalog (a child claymore contributes its own federated catalog →
+    // the catalog rolls up the hierarchy). The universal librarian; degenerate self-cards from leaf sgiandubhs included.
+    svr.Get("/catalog", [](const httplib::Request& q, httplib::Response& res) {
+        int depth = q.has_param("depth") ? std::atoi(q.get_param_value("depth").c_str()) : 4;   // recursion budget
+        json out; out["object"] = "catalog"; out["cards"] = federate_catalog(depth);
+        res.set_content(out.dump(-1, ' ', false, json::error_handler_t::replace), "application/json");
+    });
     svr.Post("/v1/chat/completions", [](const httplib::Request& q, httplib::Response& r) { handle(q, r, "chat"); });
     svr.Post("/v1/completions", [](const httplib::Request& q, httplib::Response& r) { handle(q, r, "text"); });
     svr.Post("/v1/messages", [](const httplib::Request& q, httplib::Response& r) { handle(q, r, "anthropic"); });
