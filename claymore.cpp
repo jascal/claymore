@@ -1086,7 +1086,8 @@ static void print_suggestions(const std::vector<std::string>& sugs) {
     if (sugs.empty()) return;
     std::string blk;
     for (size_t k = 0; k < sugs.size(); ++k) blk += "  " + std::to_string(k + 1) + ". " + sugs[k] + "\n";
-    printf("%s%s", g_tty ? "\x1b[2mSuggestions:\x1b[22m\n" : "Suggestions:\n", blk.c_str());
+    printf("%s%s", g_tty ? "\x1b[2mSuggestions (type #1, #2, … to pick):\x1b[22m\n"
+                         : "Suggestions (type #1, #2, … to pick):\n", blk.c_str());
     fflush(stdout);
 }
 
@@ -1187,10 +1188,12 @@ int main(int argc, char** argv) {
                         "  /experts                      list content experts (what you can study)\n"
                         "  /session <tutor> [on <e>…] [key <subset>]   mentoring session, optionally confined to a content\n"
                         "                                slice (e.g. /session socratic-tutor on book key Chapter 3)\n"
+                        "  #1 / #2 / …                   in a session, send that numbered suggestion as your next turn\n"
                         "  /end                          leave the session (back to Q&A)    /help    blank line = quit\n");
         Session session;                                          // current mentoring session (ok=false → not in one)
         std::string session_name;
         json history = json::array();                             // client-held conversation (the hub is stateless)
+        std::vector<std::string> last_suggestions;                // the tutor's most-recent suggestions (pick with "#N")
         std::string line;
         while (true) {
             std::string prompt = session.ok ? ("\n[" + session_name + "]> ") : "\n> ";
@@ -1273,7 +1276,7 @@ int main(int argc, char** argv) {
                         continue;
                     }
                     if (!s.note.empty()) fprintf(stderr, "  %s\n", s.note.c_str());
-                    session = s; session_name = tmpl.empty() ? "tutor" : tmpl; history = json::array();
+                    session = s; session_name = tmpl.empty() ? "tutor" : tmpl; history = json::array(); last_suggestions.clear();
                     std::string sc; for (const auto& n : session.scope) sc += (sc.empty() ? "" : ", ") + n;
                     if (session.key.empty())
                         fprintf(stderr, "  entered '%s' on [%s] — start talking; /end to leave\n", session_name.c_str(), sc.c_str());
@@ -1287,15 +1290,33 @@ int main(int argc, char** argv) {
                         history.push_back(json{{"role", "assistant"}, {"content", o.body}});
                         printf("%s\n", g_tty ? mdterm::render(render_text(o), true).c_str() : render_text(o).c_str());
                         fflush(stdout);
-                        print_suggestions(gen_suggestions(history, session));
+                        last_suggestions = gen_suggestions(history, session);
+                        print_suggestions(last_suggestions);
                     }
                 } else if (cmd == "end") {
-                    session = Session{}; session_name.clear(); history = json::array();
+                    session = Session{}; session_name.clear(); history = json::array(); last_suggestions.clear();
                     fprintf(stderr, "  left the session\n");
                 } else {
                     fprintf(stderr, "  unknown command (/help)\n");
                 }
                 continue;
+            }
+
+            // In a session, "#N" picks suggestion N from the tutor's last list and sends it as this turn. A leading '#'
+            // followed by anything non-numeric (e.g. "#define …") falls through and is treated as an ordinary query.
+            if (session.ok && !line.empty() && line[0] == '#') {
+                std::string num = trim(line.substr(1));
+                if (!num.empty() && num.find_first_not_of("0123456789") == std::string::npos) {
+                    int n = std::stoi(num);
+                    if (n >= 1 && n <= (int)last_suggestions.size()) {
+                        line = last_suggestions[n - 1];
+                        fprintf(stderr, "  [#%d] %s\n", n, line.c_str());
+                    } else {
+                        fprintf(stderr, "  no suggestion #%d — there %s %zu (re-ask or type your own)\n",
+                                n, last_suggestions.size() == 1 ? "is" : "are", last_suggestions.size());
+                        continue;
+                    }
+                }
             }
 
             Result r;
@@ -1310,7 +1331,7 @@ int main(int argc, char** argv) {
             }
             printf("%s\n", g_tty ? mdterm::render(render_text(r), true).c_str() : render_text(r).c_str());
             fflush(stdout);
-            if (session.ok) print_suggestions(gen_suggestions(history, session));
+            if (session.ok) { last_suggestions = gen_suggestions(history, session); print_suggestions(last_suggestions); }
         }
         return 0;
     }
