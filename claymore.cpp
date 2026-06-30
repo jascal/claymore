@@ -21,6 +21,7 @@
 #include <future>
 #include <iostream>
 #include <set>
+#include <sstream>
 #include <string>
 #include <vector>
 using json = nlohmann::json;
@@ -1042,16 +1043,72 @@ int main(int argc, char** argv) {
     if (nup == 0)
         fprintf(stderr, "  WARNING: no spokes reachable — start the sgiandubh spoke servers first.\n");
 
-    if (repl) {  // CLI: read queries from stdin, print answers (no server) — for manual testing
-        fprintf(stderr, "claymore REPL — type a query; blank line or Ctrl-D to exit.\n");
+    if (repl) {  // CLI: content Q&A by default; enter a MENTORING SESSION with /session (no server)
+        bool have_llm = !g_synth.value("url", "").empty();
+        fprintf(stderr, "claymore REPL — content Q&A by default.\n"
+                        "  /tutors                       list teaching templates (the pedagogy expert)\n"
+                        "  /experts                      list content experts (what you can study)\n"
+                        "  /session <tutor> [on <e>…]    start a mentoring session (e.g. /session socratic-tutor on riscv)\n"
+                        "  /end                          leave the session (back to Q&A)    /help    blank line = quit\n");
+        Session session;                                          // current mentoring session (ok=false → not in one)
+        std::string session_name;
+        json history = json::array();                             // client-held conversation (the hub is stateless)
         std::string line;
         while (true) {
-            fprintf(stderr, "\n> ");
+            std::string prompt = session.ok ? ("\n[" + session_name + "]> ") : "\n> ";
+            fprintf(stderr, "%s", prompt.c_str());
             fflush(stderr);
-            if (!std::getline(std::cin, line) || line.empty()) break;
-            Result r = (g_mode == "tools" && !g_synth.value("url", "").empty())
-                           ? run_tools_loop(json::array({json{{"role", "user"}, {"content", line}}}))
-                           : hub_answer(line);
+            if (!std::getline(std::cin, line)) break;
+            if (line.empty()) break;                              // blank line / Ctrl-D → quit the REPL
+
+            if (line[0] == '/') {                                 // ---- a REPL command ----
+                std::istringstream ss(line.substr(1));
+                std::string cmd; ss >> cmd;
+                if (cmd == "help") {
+                    fprintf(stderr, "  /tutors  /experts  /session <tutor> [on <expert>…]  /end  (blank = quit)\n");
+                } else if (cmd == "experts") {
+                    for (const auto& sp : g_spokes)
+                        if (sp.role != "pedagogy")
+                            fprintf(stderr, "  %-14s %s\n", sp.name.c_str(), sp.domain.c_str());
+                } else if (cmd == "tutors") {
+                    const Spoke* ped = nullptr;
+                    for (const auto& sp : g_spokes) if (sp.role == "pedagogy") ped = &sp;
+                    if (!ped) { fprintf(stderr, "  (no pedagogy expert configured — a role:\"pedagogy\" spoke)\n"); }
+                    else for (const auto& m : retrieve_spoke(*ped, "", "", 20))
+                        fprintf(stderr, "  %s\n", m.section.c_str());
+                } else if (cmd == "session") {
+                    std::string tok, tmpl, on; std::vector<std::string> scope;
+                    while (ss >> tok) {                           // "<tutor words…> [on <expert>…]"
+                        if (tok == "on") { on = tok; continue; }
+                        if (on.empty()) tmpl += (tmpl.empty() ? "" : " ") + tok; else scope.push_back(tok);
+                    }
+                    if (!have_llm) { fprintf(stderr, "  sessions need a synthesis LLM (set \"synthesis\" in the config)\n"); continue; }
+                    json sess; sess["template"] = tmpl.empty() ? "tutor" : tmpl;
+                    if (!scope.empty()) sess["scope"] = scope;
+                    Session s = assemble_session(sess);
+                    if (!s.ok) { fprintf(stderr, "  couldn't start a session (no template / pedagogy expert)\n"); continue; }
+                    session = s; session_name = tmpl.empty() ? "tutor" : tmpl; history = json::array();
+                    std::string sc; for (const auto& n : session.scope) sc += (sc.empty() ? "" : ", ") + n;
+                    fprintf(stderr, "  entered '%s' on [%s] — start talking; /end to leave\n", session_name.c_str(), sc.c_str());
+                } else if (cmd == "end") {
+                    session = Session{}; session_name.clear(); history = json::array();
+                    fprintf(stderr, "  left the session\n");
+                } else {
+                    fprintf(stderr, "  unknown command (/help)\n");
+                }
+                continue;
+            }
+
+            Result r;
+            if (session.ok) {                                     // ---- a turn IN the mentoring session ----
+                history.push_back(json{{"role", "user"}, {"content", line}});
+                r = run_tools_loop(history, session.system, session.scope);
+                history.push_back(json{{"role", "assistant"}, {"content", r.body}});
+            } else {                                              // ---- default content Q&A ----
+                r = (g_mode == "tools" && have_llm)
+                        ? run_tools_loop(json::array({json{{"role", "user"}, {"content", line}}}))
+                        : hub_answer(line);
+            }
             printf("%s\n", render_text(r).c_str());
             fflush(stdout);
         }
