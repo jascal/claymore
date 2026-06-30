@@ -327,13 +327,13 @@ static json lookup_spoke(const Spoke& sp, const std::string& id) {
 // Each spoke contributes cards via its /catalog: a leaf sgiandubh its degenerate self-card (or a catalog package's
 // document cards); a CHILD CLAYMORE its own federated catalog (recursion). So the catalog rolls up the hierarchy —
 // no node is excluded. With replicas/failover, like every other federated call.
-static json catalog_spoke(const Spoke& sp) {
+static json catalog_spoke(const Spoke& sp, int depth) {
     json cards = json::array();
     call_replica(sp, [&](const std::string& origin, const std::string& base) -> bool {
         httplib::Client cli(origin);
         cli.set_connection_timeout(5);
         cli.set_read_timeout(15);
-        auto res = cli.Get(base + "/catalog");
+        auto res = cli.Get(base + "/catalog?depth=" + std::to_string(depth));   // pass the remaining recursion budget
         if (!res || res->status != 200) return false;             // spoke lacks /catalog (older build) → fail over / skip
         try {
             for (auto& c : json::parse(res->body).value("cards", json::array())) {
@@ -346,10 +346,14 @@ static json catalog_spoke(const Spoke& sp) {
     });
     return cards;
 }
-static json federate_catalog() {
+// Recursion-BOUNDED roll-up: each hub level decrements `depth`; at 0 we stop descending (a misconfigured cycle
+// A→B→A terminates after `depth` hops instead of looping over HTTP). A leaf sgiandubh ignores ?depth. A spoke that's
+// down contributes nothing (call_replica → empty) and the rest still aggregate — partial results, never a hard fail.
+static json federate_catalog(int depth = 4) {
     json all = json::array();
+    if (depth <= 0) return all;
     for (const auto& sp : g_spokes)
-        for (auto& c : catalog_spoke(sp)) all.push_back(c);
+        for (auto& c : catalog_spoke(sp, depth - 1)) all.push_back(c);
     return all;
 }
 
@@ -1020,8 +1024,9 @@ int main(int argc, char** argv) {
     });
     // Federated /catalog — aggregate every spoke's /catalog (a child claymore contributes its own federated catalog →
     // the catalog rolls up the hierarchy). The universal librarian; degenerate self-cards from leaf sgiandubhs included.
-    svr.Get("/catalog", [](const httplib::Request&, httplib::Response& res) {
-        json out; out["object"] = "catalog"; out["cards"] = federate_catalog();
+    svr.Get("/catalog", [](const httplib::Request& q, httplib::Response& res) {
+        int depth = q.has_param("depth") ? std::atoi(q.get_param_value("depth").c_str()) : 4;   // recursion budget
+        json out; out["object"] = "catalog"; out["cards"] = federate_catalog(depth);
         res.set_content(out.dump(-1, ' ', false, json::error_handler_t::replace), "application/json");
     });
     svr.Post("/v1/chat/completions", [](const httplib::Request& q, httplib::Response& r) { handle(q, r, "chat"); });
