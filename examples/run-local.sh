@@ -15,6 +15,8 @@
 #   ./examples/run-local.sh            → claymore hub as an OpenAI server on :9000
 #   ./examples/run-local.sh --cli      → claymore CLI/REPL instead (type queries; /tutors, /session, /catalog, /experts)
 #   add --verbose to either            → trace the tools loop (tool calls, spoke hits, refuse reason)
+# Env knobs: HF_REPO / MODEL (the hub model), NGL (GPU layers), CTX (context window), EXTRA_LLAMA_ARGS (extra
+# llama-server flags), WAIT_MAX_SECS (readiness cap). For a big-RAM box with a much larger brain, see run-bigbox.sh.
 set -e
 CLI=0; VERBOSE=${VERBOSE:-}
 for a in "$@"; do case "$a" in --cli) CLI=1 ;; --verbose|-v) VERBOSE=1 ;; esac; done
@@ -40,8 +42,10 @@ pkill -f "build/claymore"         2>/dev/null || true
 sleep 1
 
 if [ -n "$MODEL" ]; then SRC=(-m "$MODEL"); else SRC=(-hf "$HF_REPO"); fi
-echo "1/4 · coding model (-ngl $NGL requested · --jinja tool-calling) → :8080   [${MODEL:-$HF_REPO}]"
-"$LLAMA" "${SRC[@]}" -ngl "$NGL" -c 8192 --jinja --host 127.0.0.1 --port 8080 >/tmp/llama.log 2>&1 &
+CTX=${CTX:-8192}                 # context window (raise for big-model demos that carry tool results + history)
+echo "1/4 · coding model (-ngl $NGL requested · -c $CTX · --jinja tool-calling) → :8080   [${MODEL:-$HF_REPO}]"
+# EXTRA_LLAMA_ARGS (optional, word-split) lets a wrapper pass extra llama-server flags, e.g. --no-mmap on a big-RAM box.
+"$LLAMA" "${SRC[@]}" -ngl "$NGL" -c "$CTX" --jinja ${EXTRA_LLAMA_ARGS:-} --host 127.0.0.1 --port 8080 >/tmp/llama.log 2>&1 &
 
 echo "2/4 · content experts → :8081 (riscv), :8082 (logic)"
 "$SG/build/sgiandubh" "$SG/package_riscv" 8081 --answer-from-corpus >/tmp/spoke_riscv.log 2>&1 &

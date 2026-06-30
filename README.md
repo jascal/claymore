@@ -72,9 +72,14 @@ enter a bounded **mentoring session** (multi-turn; the tutor is scoped to the ch
 **Full-stack demo:** `examples/run-local.sh` brings up a no-external-APIs stack on one box — a tool-capable coding
 model (llama.cpp) + content experts (riscv, logic) + a **librarian** (`role:"librarian"`, a model-free catalog over
 the content experts) + **tutors** (`role:"pedagogy"`, model-free prompt templates). Run it with `--cli` for the REPL
-(try `/catalog`, `/tutors`, `/session socratic-tutor on riscv`) or bare for the OpenAI server on :9000. The librarian
-and tutors are built by [rosetta](https://github.com/jascal/rosetta) (a sibling checkout); without it the script still
-runs the content layer and notes the others are disabled.
+(try `/catalog`, `/tutors`, `/session socratic-tutor on riscv`, then `#1`/`#2` to pick a suggested next prompt) or bare
+for the OpenAI server on :9000. The librarian and tutors are built by [rosetta](https://github.com/jascal/rosetta) (a
+sibling checkout); without it the script still runs the content layer and notes the others are disabled.
+
+**Big-box demo:** `examples/run-bigbox.sh` is the same stack with a much larger hub brain — **Qwen3-30B-A3B-Instruct-2507**
+(a sparse MoE: ~3.3B active params/token, so it's light on CPU compute but wants the full ~18.6 GB of weights in RAM to
+be fast). Use it on a machine with plenty of RAM (and optionally a GPU); on a small-RAM box the experts page from disk
+and it drags. Same flags (`--cli`, `--verbose`) and env knobs (`HF_REPO`/`MODEL`/`NGL`/`CTX`/`EXTRA_LLAMA_ARGS`).
 
 A quick REPL tour (`./examples/run-local.sh --cli`):
 
