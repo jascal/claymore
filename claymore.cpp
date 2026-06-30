@@ -1093,6 +1093,29 @@ int main(int argc, char** argv) {
                         if (on.empty()) tmpl += (tmpl.empty() ? "" : " ") + tok; else scope.push_back(tok);
                     }
                     if (!have_llm) { fprintf(stderr, "  sessions need a synthesis LLM (set \"synthesis\" in the config)\n"); continue; }
+                    auto low = [](std::string x) { for (auto& c : x) if (c >= 'A' && c <= 'Z') c += 32; return x; };
+                    // validate the `on <expert>` scope — an unknown name binds NO tools (a tutor with nothing to teach)
+                    std::vector<std::string> bad;
+                    for (const auto& n : scope) {
+                        bool known = false;
+                        for (const auto& sp : g_spokes) if (sp.name == n && sp.role.empty()) { known = true; break; }
+                        if (!known) bad.push_back(n);
+                    }
+                    if (!bad.empty()) {
+                        std::string u; for (const auto& n : bad) u += (u.empty() ? "" : ", ") + n;
+                        fprintf(stderr, "  warning: not content experts (bind no tools): %s — see /experts\n", u.c_str());
+                    }
+                    if (!scope.empty() && bad.size() == scope.size()) {
+                        fprintf(stderr, "  no valid experts in scope — the tutor would have no tools; not starting\n"); continue; }
+                    // validate the tutor name — warn (don't abort) if it'll fall back to the built-in generic tutor
+                    const Spoke* pedx = nullptr;
+                    for (const auto& sp : g_spokes) if (sp.role == "pedagogy") pedx = &sp;
+                    if (pedx && !tmpl.empty()) {
+                        bool hit = false;
+                        for (const auto& m : retrieve_spoke(*pedx, "", "", 50))
+                            if (low(m.section).find(low(tmpl)) != std::string::npos) { hit = true; break; }
+                        if (!hit) fprintf(stderr, "  note: no tutor matches '%s' — using the built-in generic tutor (see /tutors)\n", tmpl.c_str());
+                    }
                     json sess; sess["template"] = tmpl.empty() ? "tutor" : tmpl;
                     if (!scope.empty()) sess["scope"] = scope;
                     Session s = assemble_session(sess);

@@ -76,6 +76,20 @@ the content experts) + **tutors** (`role:"pedagogy"`, model-free prompt template
 and tutors are built by [rosetta](https://github.com/jascal/rosetta) (a sibling checkout); without it the script still
 runs the content layer and notes the others are disabled.
 
+A quick REPL tour (`./examples/run-local.sh --cli`):
+
+```
+/catalog                          # the librarian — every expert/collection this hub fronts
+/experts                          # the content experts you can study
+/tutors                           # the teaching templates (model-free prompt experts)
+/session socratic-tutor on riscv  # enter a bounded tutoring session; ask away; /end to leave
+what does the LR/SC pair guarantee?
+/end
+how many RISC-V instructions are there?   # back to plain Q&A (fans out to the experts)
+```
+
+Tear the whole stack down with `pkill -f 'llama-server|build/sgiandubh|build/claymore'`.
+
 ## Why the abstain-router works
 Every sgiandubh spoke answers only its own material and abstains otherwise, so claymore doesn't need a trained
 router: ask everyone (each call is sub-millisecond), keep whoever didn't abstain. Add a textbook → add a spoke line.

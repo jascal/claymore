@@ -36,6 +36,7 @@ LIBPKG="$HERE/build/demo-librarian"        # librarian package, built fresh over
 # ports. (|| true so set -e doesn't abort when there's nothing to kill.)
 pkill -f "build/bin/llama-server" 2>/dev/null || true
 pkill -f "build/sgiandubh"        2>/dev/null || true
+pkill -f "build/claymore"         2>/dev/null || true
 sleep 1
 
 if [ -n "$MODEL" ]; then SRC=(-m "$MODEL"); else SRC=(-hf "$HF_REPO"); fi
@@ -55,6 +56,8 @@ ROSETTA_PY="$ROSETTA/.venv/bin/python"
 if [ -x "$ROSETTA_PY" ] && [ -d "$ROSETTA/examples/pedagogy/package" ]; then
   echo "3/4 · model-free experts → :8200 (library, a librarian), :8300 (tutors, pedagogy)"
   # Build the librarian catalog over THIS demo's content experts (expert-level cards → lib:<name> handles, dim=0).
+  # NOTE: these cards are hand-authored for the demo — if you change the content experts above, keep them in sync.
+  # (A real librarian indexes documents via rosetta adapters rather than hand cards; see rosetta build_librarian.)
   ( cd "$ROSETTA" && PYTHONPATH=py "$ROSETTA_PY" - "$LIBPKG" >/tmp/build_librarian.log 2>&1 <<'PY'
 import sys
 from pack.build import build_librarian
@@ -79,9 +82,19 @@ else
   echo "      clone https://github.com/jascal/rosetta there (with a .venv) to enable the librarian + tutors."
 fi
 
-# wait for the model to load (the slow one) + the spokes that were started
+# wait for the model to load (the slow one) + the spokes that were started — BOUNDED, so a hung/slow box fails loudly
+# instead of spinning forever. First-run model download can be large, so the cap is generous + overridable.
+WAIT_MAX_SECS=${WAIT_MAX_SECS:-1800}
 for url in "${WAIT_URLS[@]}"; do
-  until curl -s --max-time 3 "$url" >/dev/null 2>&1; do sleep 2; done
+  waited=0
+  until curl -s --max-time 3 "$url" >/dev/null 2>&1; do
+    sleep 2; waited=$((waited + 2))
+    if [ "$waited" -ge "$WAIT_MAX_SECS" ]; then
+      echo "      ! timed out after ${WAIT_MAX_SECS}s waiting for $url — check /tmp/llama.log and /tmp/spoke_*.log" >&2
+      exit 1
+    fi
+    [ $((waited % 30)) -eq 0 ] && echo "      … still waiting for $url (${waited}s; override the cap with WAIT_MAX_SECS=)"
+  done
 done
 
 # Report ACTUAL model placement — never assume GPU. The build may be CPU/Vulkan/CUDA and -ngl silently falls back to
@@ -92,6 +105,7 @@ if [ -n "$off" ]; then echo "      → model placement: ${off}${bk:+ [$bk]}"
 else echo "      → model placement: CPU (no GPU offload)"; fi
 [ "$MODELFREE" = 1 ] && echo "      → layers up: content (riscv, logic) + library (librarian) + tutors (pedagogy)" \
                      || echo "      → layers up: content only (riscv, logic)"
+echo "      → tear it all down later with:  pkill -f 'llama-server|build/sgiandubh|build/claymore'"
 
 if [ "$CLI" = 1 ]; then
   echo "4/4 · claymore CLI — content Q&A by default; /tutors · /experts · /session <tutor> on <expert> · /catalog"
