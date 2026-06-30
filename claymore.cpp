@@ -538,6 +538,8 @@ static Result run_tools_loop(const json& client_messages) {
         } else if (g_verbose) {
             fprintf(stderr, "[claymore] iter %d: model produced final answer (%zu chars)\n", it, r.body.size());
         }
+        // A refusal must not cite the sources it consulted-but-didn't-use: tag it abstain so the Sources block is dropped.
+        if (r.body == REFUSE || is_abstain(r.body, "")) { r.mode = "abstain"; r.sources.clear(); }
         return r;
     }
     if (g_verbose) fprintf(stderr, "[claymore] hit %d-iteration cap without a final answer → refuse\n", MAX_ITERS);
