@@ -425,8 +425,26 @@ static json id_param() {                                             // per-expe
                     {"description", "the citation id / handle to refetch verbatim"}}}}},
                 {"required", json::array({"id"})}};
 }
-static json spoke_tools() {
+static json spoke_tools(const std::set<std::string>& scope = {}) {
     json tools = json::array();
+    if (!scope.empty()) {                                            // a teaching SESSION: only its in-bounds experts —
+        for (const auto& sp : g_spokes) {                           // per-expert tools, no consult/catalog/find outside
+            if (!scope.count(sp.name)) continue;                    // the scope (the syllabus boundary, enforced here)
+            json fn; fn["name"] = "ask_" + sp.name;
+            fn["description"] = "Consult the bounded expert on: " + sp.domain + ". Cited answer, or abstains.";
+            fn["parameters"] = query_param();
+            tools.push_back(json{{"type", "function"}, {"function", fn}});
+            json lf; lf["name"] = "list_" + sp.name;
+            lf["description"] = "List matching cited passages from the " + sp.name + " expert (many items, not one).";
+            lf["parameters"] = list_param();
+            tools.push_back(json{{"type", "function"}, {"function", lf}});
+            json kf; kf["name"] = "lookup_" + sp.name;
+            kf["description"] = "Refetch the exact cited source from the " + sp.name + " expert by its id.";
+            kf["parameters"] = id_param();
+            tools.push_back(json{{"type", "function"}, {"function", kf}});
+        }
+        return tools;
+    }
     if (g_tool_style == "per-expert") {                              // one tool per spoke — the LLM picks the expert
         for (const auto& sp : g_spokes) {
             json fn;
@@ -526,19 +544,21 @@ static json llm_turn(const json& messages, const json& tools) {
     return json(nullptr);
 }
 
-static Result run_tools_loop(const json& client_messages) {
+static const char* TOOLS_STEER =
+    "You must answer using ONLY the expert tool(s) provided. For every question, call the appropriate tool to get a "
+    "grounded, cited answer, then reply from that result and keep its citation. If the tools return nothing relevant, "
+    "say the topic isn't covered. Never answer from your own prior knowledge.";
+
+// `system_override` replaces the default steer (a teaching SESSION's assembled pedagogy prompt); `scope` restricts the
+// offered tools to the in-bounds content experts. Empty → the normal open tools loop.
+static Result run_tools_loop(const json& client_messages, const std::string& system_override = "",
+                             const std::set<std::string>& scope = {}) {
     Result r;
     r.mode = "tools";
     json msgs = client_messages.is_array() ? client_messages : json::array();
-    // Steer the hub LLM to actually consult the bounded experts (don't answer from its own knowledge) — so answers
-    // stay grounded + cited. Prepended as the first system message; the client's messages follow.
-    json sys = json{{"role", "system"},
-                    {"content", "You must answer using ONLY the expert tool(s) provided. For every question, call "
-                                "the appropriate tool to get a grounded, cited answer, then reply from that result "
-                                "and keep its citation. If the tools return nothing relevant, say the topic isn't "
-                                "covered. Never answer from your own prior knowledge."}};
+    json sys = json{{"role", "system"}, {"content", system_override.empty() ? std::string(TOOLS_STEER) : system_override}};
     msgs.insert(msgs.begin(), sys);
-    json tools = spoke_tools();
+    json tools = spoke_tools(scope);
     const int MAX_ITERS = 6;
     // Execute one tool call (consult_experts fan-out, or a per-expert ask_<spoke>) → the cited result text.
     auto run_tool = [&](const std::string& name, const std::string& argstr) -> std::string {
@@ -876,13 +896,91 @@ static void stream_answer(httplib::Response& res, std::string route, std::string
         });
 }
 
+// ---- teaching sessions: a pedagogy template + a bounded scope start an LLM-led session -------------------------
+// Query the pedagogy expert(s) for a template by a selector ("socratic intro tutor"). intent:"pedagogy" routes the
+// spoke's strategy to the matching template; returns its system-prompt scaffold ("" if none).
+static std::string fetch_template(const std::string& selector) {
+    for (const auto& sp : g_spokes) {
+        if (sp.role != "pedagogy") continue;
+        std::string out;
+        call_replica(sp, [&](const std::string& origin, const std::string& base) -> bool {
+            httplib::Client cli(origin);
+            cli.set_connection_timeout(5);
+            cli.set_read_timeout(20);
+            json req;
+            req["intent"] = "pedagogy";
+            req["messages"] = json::array({json{{"role", "user"}, {"content", selector}}});
+            req["response_format"] = json{{"type", "json_object"}};
+            auto res = cli.Post(base + "/v1/chat/completions", req.dump(), "application/json");
+            if (!res || res->status != 200) return false;
+            try {
+                std::string c = json::parse(res->body)["choices"][0]["message"]["content"].get<std::string>();
+                json a; try { a = json::parse(c); } catch (...) { a = json{{"answer", c}}; }
+                std::string ans = a.value("answer", "");
+                if (!ans.empty() && ans.rfind("That isn", 0) != 0) out = ans;   // a real template (not an abstain)
+                return true;                                                    // responded → don't fail over
+            } catch (...) { return false; }
+        });
+        if (!out.empty()) return out;
+    }
+    return "";
+}
+
+static std::string fill_vars(std::string s, const json& vars) {
+    for (auto it = vars.begin(); it != vars.end(); ++it) {
+        std::string needle = "{" + it.key() + "}";
+        std::string val = it.value().is_string() ? it.value().get<std::string>() : it.value().dump();
+        for (size_t p; (p = s.find(needle)) != std::string::npos;) s.replace(p, needle.size(), val);
+    }
+    return s;
+}
+
+struct Session { bool ok = false; std::string system; std::set<std::string> scope; };
+
+// Assemble a teaching session from the request's "session" object: resolve the template (inline `template_text`, else
+// fetched from the pedagogy expert by `template`), bind the scope (explicit `scope`, else all content experts), fill
+// {scope}/{objectives}/{content}/vars, and append the HARD guardrail. The tutor then gets tools ONLY for the scope.
+static Session assemble_session(const json& sess) {
+    Session s;
+    if (sess.contains("scope") && sess["scope"].is_array())
+        for (const auto& x : sess["scope"]) s.scope.insert(x.get<std::string>());
+    else
+        for (const auto& sp : g_spokes)
+            if (sp.role != "pedagogy" && sp.role != "librarian") s.scope.insert(sp.name);   // default = content experts
+    std::string scope_desc;
+    for (const auto& sp : g_spokes)
+        if (s.scope.count(sp.name)) scope_desc += (scope_desc.empty() ? "" : ", ") + sp.name + " (" + sp.domain + ")";
+    if (scope_desc.empty()) scope_desc = "the available experts";
+
+    std::string tmpl = sess.value("template_text", "");           // caller-inline template wins; else the library
+    if (tmpl.empty()) tmpl = fetch_template(sess.value("template", "tutor"));
+    if (tmpl.empty()) return s;                                   // no template resolved → ok stays false
+
+    json vars = sess.value("variables", json::object());
+    vars["scope"] = scope_desc;
+    if (!vars.contains("objectives")) vars["objectives"] = sess.value("objectives", "the topic");
+    vars["content"] = sess.value("content", "");
+    s.system = fill_vars(tmpl, vars) +
+               "\n\nGround every factual claim in the expert tools provided; you have tools ONLY for the in-scope "
+               "experts (" + scope_desc + "). If the student goes outside that scope, say so and redirect. Keep citations.";
+    s.ok = true;
+    return s;
+}
+
 static void handle(const httplib::Request& req, httplib::Response& res, const std::string& route) {
     json body;
     try { body = json::parse(req.body); }
     catch (...) { res.status = 400; res.set_content("{\"error\":\"invalid json\"}", "application/json"); return; }
-    Result r = (g_mode == "tools" && !g_synth.value("url", "").empty())
-                   ? run_tools_loop(body.value("messages", json::array()))     // agentic: LLM calls spokes as tools
-                   : hub_answer(user_text(body));                              // deterministic | llm fan-out synthesis
+    Result r;
+    if (body.contains("session") && body["session"].is_object() && !g_synth.value("url", "").empty()) {
+        Session ses = assemble_session(body["session"]);          // a teaching session: pedagogy prompt + scoped tools
+        if (ses.ok) { r = run_tools_loop(body.value("messages", json::array()), ses.system, ses.scope); }
+        else { r.body = REFUSE; r.mode = "abstain"; }             // no template could be resolved
+    } else if (g_mode == "tools" && !g_synth.value("url", "").empty()) {
+        r = run_tools_loop(body.value("messages", json::array()));  // agentic: LLM calls spokes as tools
+    } else {
+        r = hub_answer(user_text(body));                          // deterministic | llm fan-out synthesis
+    }
     std::string content = wants_json(body) ? render_json(r) : render_text(r);
     if (body.value("stream", false)) { stream_answer(res, route, content); return; }
     if (route == "anthropic") res.set_content(anthropic_message(content).dump(), "application/json");
@@ -1027,6 +1125,23 @@ int main(int argc, char** argv) {
     svr.Get("/catalog", [](const httplib::Request& q, httplib::Response& res) {
         int depth = q.has_param("depth") ? std::atoi(q.get_param_value("depth").c_str()) : 4;   // recursion budget
         json out; out["object"] = "catalog"; out["cards"] = federate_catalog(depth);
+        res.set_content(out.dump(-1, ' ', false, json::error_handler_t::replace), "application/json");
+    });
+    // Session FACTORY: assemble a teaching session (template + scope + variables → system prompt + tool scope) WITHOUT
+    // running it — for a UI / client to inspect, then drive the chat by passing the same "session" object per turn.
+    svr.Post("/session", [](const httplib::Request& q, httplib::Response& res) {
+        json b;
+        try { b = json::parse(q.body); } catch (...) { b = json::object(); }
+        json sess = b.contains("session") ? b["session"] : b;     // accept under "session" or at top level
+        Session s = assemble_session(sess);
+        json out; out["object"] = "session"; out["ok"] = s.ok;
+        if (s.ok) {
+            out["system"] = s.system;
+            out["scope"] = json(std::vector<std::string>(s.scope.begin(), s.scope.end()));
+            out["model"] = g_synth.value("model", "");
+        } else {
+            out["error"] = "no template resolved (need a pedagogy spoke, or pass session.template_text)";
+        }
         res.set_content(out.dump(-1, ' ', false, json::error_handler_t::replace), "application/json");
     });
     svr.Post("/v1/chat/completions", [](const httplib::Request& q, httplib::Response& r) { handle(q, r, "chat"); });

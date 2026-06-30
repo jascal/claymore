@@ -36,6 +36,12 @@
         "http://localhost:9101",
         "http://localhost:9102"
       ]
+    },
+    {
+      "name": "pedagogy",
+      "role": "pedagogy",
+      "domain": "teaching/mentoring templates",
+      "url": "http://localhost:8300"
     }
   ],
   "mode": "deterministic",
