@@ -11,6 +11,7 @@
 #include "httplib.h"
 #include "json.hpp"
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <chrono>
 #include <cstdio>
@@ -24,7 +25,9 @@
 #include <vector>
 using json = nlohmann::json;
 
-struct Spoke { std::string name, url, domain; };
+// A spoke can front N REDUNDANT replicas of the same expert (identical sgiandubh copies) — for reliability (failover)
+// and scale (load spread). One `url` in spokes.json → one replica; `urls`/`replicas` arrays → many.
+struct Spoke { std::string name, domain; std::vector<std::string> urls; };
 struct SAns {
     std::string answer, kind, citation, citation_id, source, spoke, route;  // route: RETRIEVED|SELECTED|COMPOSED tier
     double confidence = -1;                         // citation_id = the spoke's callable handle (→ /lookup)
@@ -55,6 +58,25 @@ static void split_url(const std::string& url, std::string& origin, std::string& 
     if (slash == std::string::npos) { origin = url; base = ""; }
     else { origin = url.substr(0, slash); base = url.substr(slash); }
     if (!base.empty() && base.back() == '/') base.pop_back();
+}
+
+static std::atomic<unsigned> g_rr{0};   // round-robin cursor for replica selection (spreads load across copies)
+
+// Try `fn(origin, base)` against the spoke's replicas: round-robin START (load spread) + FAILOVER (on a replica that's
+// down/erroring, move to the next). fn returns true if the replica RESPONDED (stop), false to fail over to the next.
+// Returns true if any replica responded. A replica that legitimately abstains has "responded" — we don't fail over
+// for that (the replicas are identical copies; only transport/HTTP failures warrant trying another).
+template <class F>
+static bool call_replica(const Spoke& sp, F&& fn) {
+    size_t k = sp.urls.size();
+    if (k == 0) return false;
+    unsigned start = g_rr.fetch_add(1, std::memory_order_relaxed);
+    for (size_t i = 0; i < k; i++) {
+        std::string origin, base;
+        split_url(sp.urls[(start + i) % k], origin, base);
+        if (fn(origin, base)) return true;
+    }
+    return false;
 }
 
 // The callable handle inside a citation: "norm:id · Section" → "norm:id" (the part before the middle dot). Used when a
@@ -98,8 +120,7 @@ static double relevance(const std::string& query, const std::string& response) {
 // ---- spokes ----------------------------------------------------------------------------------------------------
 static SAns ask_spoke(const Spoke& sp, const std::string& query) {
     SAns r;
-    std::string origin, base;
-    split_url(sp.url, origin, base);
+    call_replica(sp, [&](const std::string& origin, const std::string& base) -> bool {
     httplib::Client cli(origin);
     cli.set_connection_timeout(5);
     cli.set_read_timeout(15);
@@ -107,14 +128,14 @@ static SAns ask_spoke(const Spoke& sp, const std::string& query) {
     req["messages"] = json::array({json{{"role", "user"}, {"content", query}}});
     req["response_format"] = json{{"type", "json_object"}};
     auto res = cli.Post(base + "/v1/chat/completions", req.dump(), "application/json");
-    if (!res || res->status != 200) return r;
+    if (!res || res->status != 200) return false;             // replica down/erroring → fail over to the next
     try {
         std::string content = json::parse(res->body)["choices"][0]["message"]["content"].get<std::string>();
         json a;
         try { a = json::parse(content); }
         catch (...) { a = json{{"answer", content}, {"kind", "distilled"}}; }
         std::string ans = a.value("answer", ""), kind = a.value("kind", "distilled");
-        if (is_abstain(ans, kind)) return r;
+        if (is_abstain(ans, kind)) return true;        // replica abstained — a valid response, not a failure (r.ok stays false)
         r.answer = ans; r.kind = kind; r.spoke = sp.name;
         r.citation = a.value("citation", ""); r.source = a.value("source", "");
         r.citation_id = a.value("citation_id", "");      // the spoke's callable handle (sgiandubh emits it)
@@ -132,7 +153,9 @@ static SAns ask_spoke(const Spoke& sp, const std::string& query) {
                                    sp.name.c_str(), rel, g_min_relevance);
             r.ok = false;                               // hub relevance gate: backstop for a spoke that didn't abstain
         }
-    } catch (...) { return r; }
+        return true;                                    // replica responded (even if off-topic) — don't fail over
+    } catch (...) { return false; }                     // malformed reply → fail over to the next replica
+    });
     return r;
 }
 
@@ -162,18 +185,19 @@ struct Match { std::string spoke, section, passage; double score = 0; };
 static std::vector<Match> retrieve_spoke(const Spoke& sp, const std::string& query,
                                          const std::string& section, int max) {
     std::vector<Match> out;
-    std::string origin, base;
-    split_url(sp.url, origin, base);
-    httplib::Client cli(origin);
-    cli.set_connection_timeout(5);
-    cli.set_read_timeout(15);
-    json req{{"query", query}, {"section", section}, {"k", max}};
-    auto res = cli.Post(base + "/retrieve", req.dump(), "application/json");
-    if (!res || res->status != 200) return out;   // spoke lacks /retrieve (older build) or errored → empty
-    try {
-        for (const auto& m : json::parse(res->body).value("matches", json::array()))
-            out.push_back({sp.name, m.value("section", ""), m.value("passage", ""), m.value("score", 0.0)});
-    } catch (...) {}
+    call_replica(sp, [&](const std::string& origin, const std::string& base) -> bool {
+        httplib::Client cli(origin);
+        cli.set_connection_timeout(5);
+        cli.set_read_timeout(15);
+        json req{{"query", query}, {"section", section}, {"k", max}};
+        auto res = cli.Post(base + "/retrieve", req.dump(), "application/json");
+        if (!res || res->status != 200) return false;   // replica down / lacks /retrieve → fail over to the next
+        try {
+            for (const auto& m : json::parse(res->body).value("matches", json::array()))
+                out.push_back({sp.name, m.value("section", ""), m.value("passage", ""), m.value("score", 0.0)});
+            return true;
+        } catch (...) { return false; }
+    });
     return out;
 }
 
@@ -193,18 +217,25 @@ static std::vector<Match> retrieve_all(const std::string& query, const std::stri
 static json spoke_health() {
     json arr = json::array();
     for (const auto& sp : g_spokes) {
-        std::string origin, base;
-        split_url(sp.url, origin, base);
-        httplib::Client cli(origin);
-        cli.set_connection_timeout(2);
-        cli.set_read_timeout(3);
-        auto t0 = std::chrono::steady_clock::now();
-        auto res = cli.Get(base + "/v1/models");
-        double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-        bool up = res && res->status == 200;
+        json reps = json::array();
+        int up_n = 0;
+        for (const auto& url : sp.urls) {                          // ping EACH replica (redundancy visibility)
+            std::string origin, base;
+            split_url(url, origin, base);
+            httplib::Client cli(origin);
+            cli.set_connection_timeout(2);
+            cli.set_read_timeout(3);
+            auto t0 = std::chrono::steady_clock::now();
+            auto res = cli.Get(base + "/v1/models");
+            double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            bool up = res && res->status == 200;
+            if (up) up_n++;
+            reps.push_back(json{{"url", url}, {"up", up}, {"latency_ms", up ? (int)(ms + 0.5) : -1}});
+        }
         json o;
-        o["name"] = sp.name; o["url"] = sp.url; o["domain"] = sp.domain;
-        o["up"] = up; o["latency_ms"] = up ? (int)(ms + 0.5) : -1;
+        o["name"] = sp.name; o["domain"] = sp.domain; o["replicas"] = reps;
+        o["up"] = up_n > 0;                                        // the spoke is up if ANY replica answers (failover)
+        o["replicas_up"] = up_n; o["replicas_total"] = (int)sp.urls.size();
         arr.push_back(o);
     }
     return arr;
@@ -244,20 +275,20 @@ static std::string call_synth(const std::string& prompt) {
 // this is what makes a federated citation *callable*: an agent reads a source's {spoke,id} and refetches it here.
 static json lookup_spoke(const Spoke& sp, const std::string& id) {
     json out; out["spoke"] = sp.name; out["id"] = id; out["found"] = false;
-    std::string origin, base;
-    split_url(sp.url, origin, base);
-    httplib::Client cli(origin);
-    cli.set_connection_timeout(5);
-    cli.set_read_timeout(15);
-    auto res = cli.Get(base + "/lookup", httplib::Params{{"id", id}}, httplib::Headers{});
-    if (res && res->status == 200) {
+    call_replica(sp, [&](const std::string& origin, const std::string& base) -> bool {
+        httplib::Client cli(origin);
+        cli.set_connection_timeout(5);
+        cli.set_read_timeout(15);
+        auto res = cli.Get(base + "/lookup", httplib::Params{{"id", id}}, httplib::Headers{});
+        if (!res || res->status != 200) return false;             // replica down → fail over to the next
         try {
             json j = json::parse(res->body);
             out["found"] = j.value("found", false);
             if (j.contains("section")) out["section"] = j["section"];
             if (j.contains("passage")) out["passage"] = j["passage"];
-        } catch (...) {}
-    }
+            return true;
+        } catch (...) { return false; }
+    });
     return out;
 }
 
@@ -749,7 +780,20 @@ int main(int argc, char** argv) {
     std::ifstream f(cfg_path);
     if (!f) { fprintf(stderr, "claymore: cannot open %s\n", cfg_path.c_str()); return 1; }
     json cfg; f >> cfg;
-    for (auto& s : cfg["spokes"]) g_spokes.push_back({s.value("name", ""), s.value("url", ""), s.value("domain", "")});
+    for (auto& s : cfg["spokes"]) {                               // "url" (single) and/or "urls"/"replicas" (redundant copies)
+        Spoke sp;
+        sp.name = s.value("name", "");
+        sp.domain = s.value("domain", "");
+        for (const char* key : {"urls", "replicas"})
+            if (s.contains(key) && s[key].is_array())
+                for (auto& u : s[key]) sp.urls.push_back(u.get<std::string>());
+        if (s.contains("url") && s["url"].is_string()) sp.urls.push_back(s["url"].get<std::string>());
+        std::vector<std::string> uniq;                           // dedupe (a replica listed twice, or url ∈ urls) —
+        std::set<std::string> seen;                              // order-preserving, so round-robin isn't skewed
+        for (auto& u : sp.urls) if (!u.empty() && seen.insert(u).second) uniq.push_back(u);
+        sp.urls = std::move(uniq);
+        if (!sp.urls.empty()) g_spokes.push_back(std::move(sp));
+    }
     g_mode = cfg.value("mode", "deterministic");
     g_top_k = cfg.value("top_k", 3);
     g_tool_style = cfg.value("tool_style", "generic");
