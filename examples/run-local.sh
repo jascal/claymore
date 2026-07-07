@@ -17,6 +17,9 @@
 #   add --verbose to either            → trace the tools loop (tool calls, spoke hits, refuse reason)
 # Env knobs: HF_REPO / MODEL (the hub model), NGL (GPU layers), CTX (context window), EXTRA_LLAMA_ARGS (extra
 # llama-server flags), WAIT_MAX_SECS (readiness cap). For a big-RAM box with a much larger brain, see run-bigbox.sh.
+# BEST PRACTICE (unified packages): serve next-token experts with `sgiandubh --rosetta-package <dir> <port>`
+# and launch claymore with `--min-relevance 0` for them (word-level relevance vs subword citations). Responses
+# carry consulted[] attribution; add "fallback":"ungrounded" to the spokes config for labeled benchmark behavior.
 set -e
 CLI=0; VERBOSE=${VERBOSE:-}
 for a in "$@"; do case "$a" in --cli) CLI=1 ;; --verbose|-v) VERBOSE=1 ;; esac; done
