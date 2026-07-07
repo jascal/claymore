@@ -53,6 +53,7 @@ struct Result {                                   // the hub's answer + provenan
 
 static std::vector<Spoke> g_spokes;
 static std::string g_mode = "deterministic";
+static bool g_fallback_ungrounded = false;        // all-abstain -> hub LLM answers, LABELED (config "fallback":"ungrounded")
 static int g_top_k = 3;
 static std::string g_tool_style = "generic";      // tools mode: "generic" (one consult_experts tool) | "per-expert"
 static bool g_verbose = false;                     // --verbose / -v: trace the tools loop (tool calls, spoke results, why it refused)
@@ -695,8 +696,9 @@ static Result run_tools_loop(const json& client_messages, const std::string& sys
             return !name.empty();
         } catch (...) { return false; }
     };
-    for (int it = 0; it < MAX_ITERS; it++) {
-        json m = llm_turn(msgs, tools);
+    bool any_grounded = false;                                            // evidence-based fallback
+    for (int it = 0; it < MAX_ITERS; it++) {                              // trigger: did ANY tool
+        json m = llm_turn(msgs, tools);                                   // return grounded results?
         if (m.is_null()) { r.body = REFUSE; r.mode = "abstain"; return r; }   // backend unreachable
         if (m.contains("tool_calls") && m["tool_calls"].is_array() && !m["tool_calls"].empty()) {
             msgs.push_back(m);                                                // the assistant turn (with tool_calls)
@@ -717,6 +719,7 @@ static Result run_tools_loop(const json& client_messages, const std::string& sys
         if (as_text_toolcall(content, tname, targs)) {                       // tool call emitted as TEXT — run it anyway
             if (g_verbose) fprintf(stderr, "[claymore] iter %d: model emitted a tool call as text (%s); executing it\n", it, tname.c_str());
             std::string toolres = run_tool(tname, targs);
+            if (toolres.find("(no ") != 0 && !toolres.empty()) any_grounded = true;
             msgs.push_back(m);                                                // the assistant text turn
             msgs.push_back(json{{"role", "user"},
                                 {"content", "Expert tool results:\n" + toolres +
@@ -731,7 +734,21 @@ static Result run_tools_loop(const json& client_messages, const std::string& sys
             fprintf(stderr, "[claymore] iter %d: model produced final answer (%zu chars)\n", it, r.body.size());
         }
         // A refusal must not cite the sources it consulted-but-didn't-use: tag it abstain so the Sources block is dropped.
-        if (r.body == REFUSE || is_abstain(r.body, "")) { r.mode = "abstain"; r.sources.clear(); }
+        if (r.body == REFUSE || is_abstain(r.body, "") || (!any_grounded && g_fallback_ungrounded)) {
+            r.mode = "abstain"; r.sources.clear();
+            if (g_fallback_ungrounded) {                                     // LABELED-UNGROUNDED fallback:
+                // the hub answers from its own knowledge, and SAYS SO -- the
+                json fmsgs = json::array();
+                for (const auto& cm : client_messages)
+                    if (cm.value("role", "") == "user") fmsgs.push_back(cm);
+                json m2 = llm_turn(fmsgs, json::array());                    // hard contract stays default-on
+                std::string c2 = m2.is_null() ? "" : m2.value("content", "");
+                if (!c2.empty()) {
+                    r.body = "[ungrounded — no expert coverage; hub model answer] " + c2;
+                    r.mode = "ungrounded";
+                }
+            }
+        }
         return r;
     }
     if (g_verbose) fprintf(stderr, "[claymore] hit %d-iteration cap without a final answer → refuse\n", MAX_ITERS);
@@ -1160,6 +1177,7 @@ int main(int argc, char** argv) {
         if (!sp.urls.empty()) g_spokes.push_back(std::move(sp));
     }
     g_mode = cfg.value("mode", "deterministic");
+    g_fallback_ungrounded = cfg.value("fallback", std::string("")) == "ungrounded";
     g_top_k = cfg.value("top_k", 3);
     g_tool_style = cfg.value("tool_style", "generic");
     g_synth = cfg.value("synthesis", json::object());
