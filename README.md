@@ -14,6 +14,13 @@ confidence, and answers in one of two modes:
   queries, feeds the cited results back, and loops to a final answer. One generic `consult_experts` tool by default
   (claymore fan-out-routes — best for small models), or `tool_style:"per-expert"` for one `ask_<spoke>` tool each.
 
+Optional `"fallback": "ungrounded"` (default OFF): when NO tool call returned grounded expert
+results, the hub LLM answers from its own knowledge with an explicit label
+(`[ungrounded — no expert coverage; hub model answer] …`, `mode: "ungrounded"`). The trigger is
+EVIDENCE-based (tracked per tool call), not phrasing-based — an LLM that composes its own
+refusal text or guesses anyway is still labeled honestly. Use for open benchmarks; leave off
+for bounded deployment.
+
 The hard promise is enforced **in code, not a prompt**: if every spoke abstains, claymore refuses — which survives a
 jailbroken hub LLM. Clients see one OpenAI endpoint regardless of mode.
 
