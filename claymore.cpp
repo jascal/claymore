@@ -49,7 +49,9 @@ struct Result {                                   // the hub's answer + provenan
     double margin = 1e9;
     std::vector<Src> sources;                      // (spoke, citation, id) — id + spoke make the cite resolvable via /lookup
     std::vector<std::string> suggestions;          // tutor sessions: suggested next prompts for the learner (may be empty)
-};
+    json consulted = json::array();                // SUB-QUESTION ATTRIBUTION: every tool call the
+};                                                // hub made -- (tool, query, grounded) -- so a
+                                                  // consumer can see HOW an answer was composed
 
 static std::vector<Spoke> g_spokes;
 static std::string g_mode = "deterministic";
@@ -719,7 +721,9 @@ static Result run_tools_loop(const json& client_messages, const std::string& sys
         if (as_text_toolcall(content, tname, targs)) {                       // tool call emitted as TEXT — run it anyway
             if (g_verbose) fprintf(stderr, "[claymore] iter %d: model emitted a tool call as text (%s); executing it\n", it, tname.c_str());
             std::string toolres = run_tool(tname, targs);
-            if (toolres.find("(no ") != 0 && !toolres.empty()) any_grounded = true;
+            bool g1 = toolres.find("(no ") != 0 && !toolres.empty();
+            if (g1) any_grounded = true;
+            r.consulted.push_back({{"tool", tname}, {"query", targs.substr(0, 120)}, {"grounded", g1}});
             msgs.push_back(m);                                                // the assistant text turn
             msgs.push_back(json{{"role", "user"},
                                 {"content", "Expert tool results:\n" + toolres +
@@ -810,6 +814,7 @@ static std::string render_json(const Result& r) {
     json j;
     j["answer"] = r.body;
     j["mode"] = r.mode;
+    if (!r.consulted.empty()) j["consulted"] = r.consulted;
     // sgiandubh-compatible FLAT fields, so a PARENT claymore (or any client) parses this hub exactly like a leaf
     // spoke — this is what makes claymores nest (federated claymores). kind=abstain → the parent treats it as an abstain.
     j["kind"] = (r.mode == "abstain") ? "abstain" : "federated";
