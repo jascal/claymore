@@ -1,11 +1,27 @@
 {
   "spokes": [
-    {"name": "riscv", "url": "http://localhost:8081", "domain": "RISC-V ISA specification"},
-    {"name": "logic", "url": "http://localhost:8082", "domain": "formal logic"},
-    {"name": "library", "role": "librarian", "url": "http://localhost:8200",
-     "domain": "catalog of the bounded experts this hub fronts (the librarian)"},
-    {"name": "tutors", "role": "pedagogy", "url": "http://localhost:8300",
-     "domain": "teaching/mentoring templates (model-free prompt experts)"}
+    {
+      "name": "riscv",
+      "url": "http://localhost:8081",
+      "domain": "RISC-V ISA specification"
+    },
+    {
+      "name": "logic",
+      "url": "http://localhost:8082",
+      "domain": "formal logic"
+    },
+    {
+      "name": "library",
+      "role": "librarian",
+      "url": "http://localhost:8200",
+      "domain": "catalog of the bounded experts this hub fronts (the librarian)"
+    },
+    {
+      "name": "tutors",
+      "role": "pedagogy",
+      "url": "http://localhost:8300",
+      "domain": "teaching/mentoring templates (model-free prompt experts)"
+    }
   ],
   "mode": "tools",
   "tool_style": "generic",
@@ -13,5 +29,7 @@
     "url": "http://localhost:8080/v1",
     "model": "qwen2.5-coder-7b-instruct",
     "format": "openai"
-  }
+  },
+  "_comment": "BEST PRACTICE: mode 'tools' + tool_style 'generic'. For NEXT-TOKEN spokes (sgiandubh --rosetta-package) launch claymore with --min-relevance 0 -- the word-level relevance gate silently drops subword-cited answers. Responses carry consulted[] = (tool, query, grounded) per call: sub-question attribution.",
+  "_fallback": "OPTIONAL benchmark behavior: \"fallback\": \"ungrounded\" -- when NO tool call returns grounded results the hub LLM answers, LABELED '[ungrounded -- no expert coverage; hub model answer]' (mode: ungrounded). Default OFF: the hard all-abstain->refuse contract stays for bounded deployment."
 }
