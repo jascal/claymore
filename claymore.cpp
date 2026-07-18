@@ -22,6 +22,7 @@
 #include <fstream>
 #include <future>
 #include <iostream>
+#include <memory>
 #include <set>
 #include <sstream>
 #include <string>
@@ -74,6 +75,14 @@ static void split_url(const std::string& url, std::string& origin, std::string& 
 }
 
 static std::atomic<unsigned> g_rr{0};   // round-robin cursor for replica selection (spreads load across copies)
+static std::atomic<unsigned long long> g_req_seq{0};  // inbound request id counter → "req-<n>"
+
+// Per-request tracing state: cpp-httplib serves each request on one pool thread, so thread_local is safe.
+struct ReqTrace {
+    std::string id;
+    std::chrono::steady_clock::time_point start{};
+};
+static thread_local ReqTrace g_req_trace;
 
 // Try `fn(origin, base)` against the spoke's replicas: round-robin START (load spread) + FAILOVER (on a replica that's
 // down/erroring, move to the next). fn returns true if the replica RESPONDED (stop), false to fail over to the next.
@@ -1186,6 +1195,17 @@ int main(int argc, char** argv) {
     g_top_k = cfg.value("top_k", 3);
     g_tool_style = cfg.value("tool_style", "generic");
     g_synth = cfg.value("synthesis", json::object());
+    // Optional gateway hardening (all additive — absent keys preserve plain-HTTP / no-auth behavior):
+    //   tls_cert + tls_key  → HTTPS via SSLServer (both required, or neither)
+    //   api_keys            → require Authorization: Bearer / x-api-key (empty/absent = open)
+    //   access_log          → stderr access log per request (default true when key absent)
+    std::string tls_cert = cfg.value("tls_cert", std::string(""));
+    std::string tls_key  = cfg.value("tls_key",  std::string(""));
+    std::set<std::string> api_keys;
+    if (cfg.contains("api_keys") && cfg["api_keys"].is_array())
+        for (auto& k : cfg["api_keys"])
+            if (k.is_string() && !k.get<std::string>().empty()) api_keys.insert(k.get<std::string>());
+    bool access_log = cfg.value("access_log", true);
     std::string extra;
     if (g_mode == "llm" || g_mode == "tools")
         extra = " · synth=" + g_synth.value("format", "openai") + "@" + g_synth.value("url", "?");
@@ -1374,15 +1394,81 @@ int main(int argc, char** argv) {
         return 0;
     }
 
-    fprintf(stderr, "claymore: listening :%d\n", port);
-    httplib::Server svr;
-    svr.Get("/v1/models", [](const httplib::Request&, httplib::Response& res) {
+    // TLS misconfiguration: both cert and key required, or neither. Never silently fall back to plaintext.
+    if (tls_cert.empty() != tls_key.empty()) {
+        fprintf(stderr, "claymore: tls_cert and tls_key must both be set (got cert=%s key=%s)\n",
+                tls_cert.empty() ? "(empty)" : tls_cert.c_str(),
+                tls_key.empty()  ? "(empty)" : tls_key.c_str());
+        return 1;
+    }
+    std::unique_ptr<httplib::Server> srv;
+    if (!tls_cert.empty()) {
+#ifdef CPPHTTPLIB_OPENSSL_SUPPORT
+        auto svr_ssl = std::make_unique<httplib::SSLServer>(tls_cert.c_str(), tls_key.c_str());
+        if (!svr_ssl->is_valid()) {
+            fprintf(stderr, "claymore: failed to load TLS cert/key (%s / %s)\n",
+                    tls_cert.c_str(), tls_key.c_str());
+            return 1;
+        }
+        srv = std::move(svr_ssl);
+#else
+        fprintf(stderr, "claymore: tls_cert/tls_key configured but this binary was built without OpenSSL support "
+                        "— rebuild with OpenSSL installed\n");
+        return 1;
+#endif
+    } else {
+        srv = std::make_unique<httplib::Server>();
+    }
+    fprintf(stderr, "claymore: listening :%d%s\n", port, (!tls_cert.empty() ? " (TLS)" : ""));
+
+    // Request ID (always) + optional API-key auth. Short-circuits with 401 when keys are configured and missing/wrong.
+    // /health and /healthz stay open for load-balancer probes.
+    srv->set_pre_routing_handler([api_keys](const httplib::Request& req, httplib::Response& res) {
+        g_req_trace.id = "req-" + std::to_string(++g_req_seq);
+        g_req_trace.start = std::chrono::steady_clock::now();
+        res.set_header("x-request-id", g_req_trace.id);
+
+        if (!api_keys.empty() && req.path != "/health" && req.path != "/healthz") {
+            bool ok = false;
+            if (req.has_header("x-api-key"))
+                ok = api_keys.count(req.get_header_value("x-api-key")) > 0;
+            if (!ok && req.has_header("Authorization")) {
+                std::string a = req.get_header_value("Authorization");
+                const char* pref = "Bearer ";
+                const size_t plen = 7;  // strlen("Bearer ")
+                if (a.size() > plen && a.compare(0, plen, pref) == 0)
+                    ok = api_keys.count(a.substr(plen)) > 0;
+            }
+            if (!ok) {
+                res.status = 401;
+                res.set_content(
+                    R"({"error":{"type":"authentication_error","message":"invalid or missing api key"}})",
+                    "application/json");
+                // Logger still runs for pre-routing Handled responses (write_response_core → logger_); no extra log here.
+                return httplib::Server::HandlerResponse::Handled;
+            }
+        }
+        return httplib::Server::HandlerResponse::Unhandled;
+    });
+
+    if (access_log) {
+        srv->set_logger([](const httplib::Request& req, const httplib::Response& res) {
+            auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                          std::chrono::steady_clock::now() - g_req_trace.start)
+                          .count();
+            fprintf(stderr, "[access] %s %s %s %d %zu %lldms\n", g_req_trace.id.c_str(),
+                    req.method.c_str(), req.path.c_str(), res.status, res.body.size(),
+                    static_cast<long long>(ms));
+        });
+    }
+
+    srv->Get("/v1/models", [](const httplib::Request&, httplib::Response& res) {
         json e; e["id"] = "claymore"; e["object"] = "model"; e["owned_by"] = "claymore";
         json m; m["object"] = "list"; m["data"] = json::array({e});
         res.set_content(m.dump(), "application/json");
     });
     // domain manifest — so an outer agent (or claymore-as-a-tool) can discover what this hub covers.
-    svr.Get("/v1/domains", [](const httplib::Request&, httplib::Response& res) {
+    srv->Get("/v1/domains", [](const httplib::Request&, httplib::Response& res) {
         json data = json::array();
         for (const auto& sp : g_spokes) data.push_back(json{{"name", sp.name}, {"domain", sp.domain}});
         json m; m["object"] = "list"; m["data"] = data;
@@ -1403,8 +1489,8 @@ int main(int argc, char** argv) {
         res.status = (up > 0) ? 200 : 503;
         res.set_content(m.dump(), "application/json");
     };
-    svr.Get("/health", health_handler);
-    svr.Get("/healthz", health_handler);
+    srv->Get("/health", health_handler);
+    srv->Get("/healthz", health_handler);
     // Federated citation-as-handle: refetch the exact source a federated citation points to. GET /lookup?spoke=&id=
     // (spoke optional → tries all). Routes to the owning spoke's /lookup; bounded — unknown spoke/id → not found.
     auto lookup_handler = [](const httplib::Request& q, httplib::Response& res) {
@@ -1424,11 +1510,11 @@ int main(int argc, char** argv) {
         res.status = found ? 200 : 404;
         res.set_content(out.dump(), "application/json");
     };
-    svr.Get("/lookup", lookup_handler);
-    svr.Post("/lookup", lookup_handler);
+    srv->Get("/lookup", lookup_handler);
+    srv->Post("/lookup", lookup_handler);
     // Federated /retrieve — the sgiandubh extension, fanned across this hub's content spokes. So a PARENT claymore can
     // list-retrieve from this hub exactly as from a leaf (claymores nest: same API surface, replicas for HA).
-    svr.Post("/retrieve", [](const httplib::Request& q, httplib::Response& res) {
+    srv->Post("/retrieve", [](const httplib::Request& q, httplib::Response& res) {
         json b;
         try { b = json::parse(q.body); } catch (...) { b = json::object(); }
         auto ms = retrieve_all(b.value("query", ""), b.value("section", ""), b.value("k", 20));
@@ -1440,14 +1526,14 @@ int main(int argc, char** argv) {
     });
     // Federated /catalog — aggregate every spoke's /catalog (a child claymore contributes its own federated catalog →
     // the catalog rolls up the hierarchy). The universal librarian; degenerate self-cards from leaf sgiandubhs included.
-    svr.Get("/catalog", [](const httplib::Request& q, httplib::Response& res) {
+    srv->Get("/catalog", [](const httplib::Request& q, httplib::Response& res) {
         int depth = q.has_param("depth") ? std::atoi(q.get_param_value("depth").c_str()) : 4;   // recursion budget
         json out; out["object"] = "catalog"; out["cards"] = federate_catalog(depth);
         res.set_content(out.dump(-1, ' ', false, json::error_handler_t::replace), "application/json");
     });
     // Session FACTORY: assemble a teaching session (template + scope + variables → system prompt + tool scope) WITHOUT
     // running it — for a UI / client to inspect, then drive the chat by passing the same "session" object per turn.
-    svr.Post("/session", [](const httplib::Request& q, httplib::Response& res) {
+    srv->Post("/session", [](const httplib::Request& q, httplib::Response& res) {
         json b;
         try { b = json::parse(q.body); } catch (...) { b = json::object(); }
         json sess = b.contains("session") ? b["session"] : b;     // accept under "session" or at top level
@@ -1462,12 +1548,12 @@ int main(int argc, char** argv) {
         }
         res.set_content(out.dump(-1, ' ', false, json::error_handler_t::replace), "application/json");
     });
-    svr.Post("/v1/chat/completions", [](const httplib::Request& q, httplib::Response& r) { handle(q, r, "chat"); });
-    svr.Post("/v1/completions", [](const httplib::Request& q, httplib::Response& r) { handle(q, r, "text"); });
-    svr.Post("/v1/messages", [](const httplib::Request& q, httplib::Response& r) { handle(q, r, "anthropic"); });
-    svr.set_keep_alive_max_count(1000);
-    svr.set_keep_alive_timeout(30);
-    svr.set_tcp_nodelay(true);
-    svr.listen("0.0.0.0", port);
+    srv->Post("/v1/chat/completions", [](const httplib::Request& q, httplib::Response& r) { handle(q, r, "chat"); });
+    srv->Post("/v1/completions", [](const httplib::Request& q, httplib::Response& r) { handle(q, r, "text"); });
+    srv->Post("/v1/messages", [](const httplib::Request& q, httplib::Response& r) { handle(q, r, "anthropic"); });
+    srv->set_keep_alive_max_count(1000);
+    srv->set_keep_alive_timeout(30);
+    srv->set_tcp_nodelay(true);
+    srv->listen("0.0.0.0", port);
     return 0;
 }
