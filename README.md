@@ -124,6 +124,27 @@ confined to that slice on every tool call — e.g. a tutor on a whole-book exper
 `/session socratic-tutor on book key Chapter 3`; via the API: `{"session": {"template": "...", "scope": ["book"],
 "key": "Chapter 3"}}`. (You can also pre-bake a subset as its own keyed spoke and start the tutor on that — same effect.)
 
+## Gateway options
+Optional top-level config keys for production exposure (all additive — omit them and behavior stays plain HTTP, open
+access, except the default-on access log):
+
+| key | type | default | effect |
+|-----|------|---------|--------|
+| `tls_cert` / `tls_key` | string paths | unset | Both set → serve HTTPS via OpenSSL (`SSLServer`). One without the other, or certs with a non-OpenSSL build → fatal exit (no silent plaintext fallback). |
+| `api_keys` | array of strings | unset / `[]` | Non-empty → every request must send `Authorization: Bearer <key>` or `x-api-key: <key>` matching an entry; else HTTP 401 JSON. **Exempt:** `/health` and `/healthz` (LB probes). |
+| `access_log` | bool | `true` | When true, one stderr line per request: `[access] <req-id> <METHOD> <path> <status> <bytes> <ms>ms`. Set `false` to silence. |
+
+Every response also gets an `x-request-id: req-<n>` header (always on). No new CLI flags — these are config-file-only.
+
+```json
+{
+  "tls_cert": "/path/fullchain.pem",
+  "tls_key":  "/path/privkey.pem",
+  "api_keys": ["key1", "key2"],
+  "access_log": true
+}
+```
+
 ## Why the abstain-router works
 Every sgiandubh spoke answers only its own material and abstains otherwise, so claymore doesn't need a trained
 router: ask everyone (each call is sub-millisecond), keep whoever didn't abstain. Add a textbook → add a spoke line.

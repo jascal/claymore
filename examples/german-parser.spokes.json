@@ -1,0 +1,4 @@
+{ "spokes": [
+    {"name": "german-parser", "url": "http://localhost:8094", "domain": "German grammar: Universal Dependencies parse, POS, case, morphology"},
+    {"name": "riscv", "url": "http://localhost:8081", "domain": "RISC-V ISA specification"} ],
+  "mode": "deterministic" }
